@@ -1,6 +1,8 @@
 """Tests for CLI parser construction."""
 
-from quant_daily_bars._cli_impl import build_parser
+from datetime import date
+
+from quant_daily_bars._cli_impl import build_parser, _contiguous_ranges
 
 
 class TestCLIParser:
@@ -51,3 +53,49 @@ class TestCLIParser:
         args = parser.parse_args(["bars", "ingest", "--schedule", "86400"])
         assert args.from_date is None
         assert args.schedule == 86400
+
+    def test_backfill_gaps_defaults(self):
+        parser = build_parser()
+        args = parser.parse_args(["bars", "backfill-gaps"])
+        assert args.bars_command == "backfill-gaps"
+        assert args.from_date == date(2025, 6, 1)
+        assert getattr(args, "schedule", None) is None
+
+    def test_backfill_gaps_with_schedule(self):
+        parser = build_parser()
+        args = parser.parse_args(["bars", "backfill-gaps", "--schedule", "86400"])
+        assert args.schedule == 86400
+        assert args.from_date == date(2025, 6, 1)
+
+    def test_backfill_gaps_custom_from_date(self):
+        parser = build_parser()
+        args = parser.parse_args(["bars", "backfill-gaps", "--from-date", "2024-01-01"])
+        assert args.from_date == date(2024, 1, 1)
+
+
+class TestContiguousRanges:
+    def test_empty(self):
+        assert _contiguous_ranges([]) == []
+
+    def test_single_date(self):
+        result = _contiguous_ranges([date(2024, 1, 2)])
+        assert result == [(date(2024, 1, 2), date(2024, 1, 2))]
+
+    def test_contiguous_weekdays(self):
+        dates = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)]
+        result = _contiguous_ranges(dates)
+        assert result == [(date(2024, 1, 2), date(2024, 1, 5))]
+
+    def test_weekend_bridge(self):
+        # Fri Jan 5 -> Mon Jan 8 should be one range (gap=3)
+        dates = [date(2024, 1, 5), date(2024, 1, 8)]
+        result = _contiguous_ranges(dates)
+        assert result == [(date(2024, 1, 5), date(2024, 1, 8))]
+
+    def test_gap_splits_ranges(self):
+        # Jan 2-3, then skip a week, Jan 10-11
+        dates = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 10), date(2024, 1, 11)]
+        result = _contiguous_ranges(dates)
+        assert len(result) == 2
+        assert result[0] == (date(2024, 1, 2), date(2024, 1, 3))
+        assert result[1] == (date(2024, 1, 10), date(2024, 1, 11))

@@ -6,6 +6,7 @@ import json
 
 from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
 from quant_daily_bars.vendors.polygon.config import PolygonConfig
+from quant_daily_bars.vendors.polygon.rate_limiter import SharedRateLimiter
 from quant_daily_bars.vendors.polygon.transport import TransportResponse
 
 
@@ -49,7 +50,8 @@ class TestPolygonBarsClient:
     def _make_client(self, responses):
         config = PolygonConfig(api_key="test-key", rate_limit_rpm=0)
         transport = MockTransport(responses=responses)
-        return PolygonBarsClient(config, transport=transport, sleep=lambda _: None)
+        limiter = SharedRateLimiter(rpm=0)  # disable for unit tests
+        return PolygonBarsClient(config, transport=transport, sleep=lambda _: None, rate_limiter=limiter)
 
     def test_get_daily_bars(self):
         client = self._make_client([_ok_response(_bar_payload())])

@@ -202,6 +202,153 @@ def bars_ingest(args: argparse.Namespace) -> None:
         time.sleep(interval)
 
 
+def bars_backfill_gaps(args: argparse.Namespace) -> None:
+    """Find and fill missing bars for all active symbols between a start date and yesterday."""
+    from sqlalchemy import text as sa_text
+
+    from quant_daily_bars.ingest.job import DailyBarIngestJob, IngestOptions
+    from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
+    from quant_daily_bars.vendors.polygon.errors import (
+        PolygonAuthError,
+        PolygonConfigError,
+        PolygonRateLimitError,
+    )
+
+    interval = getattr(args, "schedule", None)
+    run_once = interval is None
+    gap_start = args.from_date
+    log = logging.getLogger(__name__)
+
+    while True:
+        yesterday = date.today() - timedelta(days=1)
+        if gap_start >= yesterday:
+            log.info("gap start %s >= yesterday %s, nothing to scan", gap_start, yesterday)
+            if run_once:
+                break
+            time.sleep(interval)
+            continue
+
+        engine = _engine()
+        try:
+            client = PolygonBarsClient.from_env()
+        except PolygonConfigError as exc:
+            print(f"ERROR: {exc}")
+            print("  Hint: set MASSIVE_API_KEY in your environment or .env file.")
+            if run_once:
+                raise SystemExit(1) from exc
+            time.sleep(interval)
+            continue
+
+        # Find active symbols and their missing date ranges
+        with engine.connect() as conn:
+            symbols = conn.execute(
+                sa_text("""
+                    SELECT id, canonical_ticker FROM symbol_master.symbols
+                    WHERE active = true
+                    ORDER BY canonical_ticker
+                """)
+            ).fetchall()
+
+        if not symbols:
+            log.warning("no active symbols found")
+            if run_once:
+                break
+            time.sleep(interval)
+            continue
+
+        total_gaps_filled = 0
+        total_symbols_with_gaps = 0
+
+        for sym_id, ticker in symbols:
+            # Find dates we already have for this symbol in the range
+            with engine.connect() as conn:
+                existing_dates = set(
+                    conn.execute(
+                        sa_text("""
+                            SELECT bar_date FROM market_data.daily_bars
+                            WHERE symbol_id = :symbol_id
+                              AND bar_date >= :start AND bar_date <= :end
+                              AND adjustment_type = 'unadjusted'
+                        """),
+                        {"symbol_id": sym_id, "start": gap_start, "end": yesterday},
+                    ).scalars().all()
+                )
+
+            # Generate all weekdays in range (Mon-Fri) as candidate trading days
+            candidate_dates = []
+            d = gap_start
+            while d <= yesterday:
+                if d.weekday() < 5:  # Mon=0 .. Fri=4
+                    candidate_dates.append(d)
+                d += timedelta(days=1)
+
+            missing_dates = sorted(set(candidate_dates) - existing_dates)
+
+            if not missing_dates:
+                continue
+
+            total_symbols_with_gaps += 1
+
+            # Batch contiguous missing dates into ranges to minimize API calls
+            ranges = _contiguous_ranges(missing_dates)
+            log.info("%s: %d missing dates in %d range(s)", ticker, len(missing_dates), len(ranges))
+
+            for range_start, range_end in ranges:
+                options = IngestOptions(
+                    from_date=range_start,
+                    to_date=range_end,
+                    tickers=[ticker],
+                    adjustment_type="unadjusted",
+                    mode="backfill",
+                )
+                job = DailyBarIngestJob(engine=engine, client=client)
+                try:
+                    summary = job.run(options)
+                    total_gaps_filled += summary.bars_upserted
+                    log.info(
+                        "%s: filled %d bars for %s to %s",
+                        ticker, summary.bars_upserted, range_start, range_end,
+                    )
+                except (PolygonAuthError, PolygonRateLimitError) as exc:
+                    log.error("%s: API error filling gaps: %s", ticker, exc)
+                    if run_once:
+                        raise SystemExit(1) from exc
+                    break  # stop this symbol, try next cycle
+                except Exception as exc:
+                    log.error("%s: error filling gaps %s-%s: %s", ticker, range_start, range_end, exc)
+
+        print(
+            f"backfill_gaps  symbols_with_gaps={total_symbols_with_gaps}  "
+            f"bars_filled={total_gaps_filled}  range={gap_start}..{yesterday}"
+        )
+
+        if run_once:
+            break
+
+        log.info("next gap-fill scan in %d seconds", interval)
+        time.sleep(interval)
+
+
+def _contiguous_ranges(dates: list[date]) -> list[tuple[date, date]]:
+    """Group sorted dates into contiguous (start, end) ranges."""
+    if not dates:
+        return []
+    ranges = []
+    start = dates[0]
+    prev = dates[0]
+    for d in dates[1:]:
+        # Allow weekend gaps: if prev is Friday and d is Monday, still contiguous
+        gap = (d - prev).days
+        if gap <= 3:  # covers Fri->Mon
+            prev = d
+        else:
+            ranges.append((start, prev))
+            start = d
+            prev = d
+    ranges.append((start, prev))
+    return ranges
+
+
 def bars_run_summary(args: argparse.Namespace) -> None:
     from quant_daily_bars.ingest.job import DailyBarIngestJob
 
@@ -267,6 +414,17 @@ def build_parser() -> argparse.ArgumentParser:
     run_summary_parser = bars_subparsers.add_parser("run-summary")
     run_summary_parser.add_argument("--latest", action="store_true", required=True)
     run_summary_parser.set_defaults(func=bars_run_summary)
+
+    backfill_gaps_parser = bars_subparsers.add_parser("backfill-gaps")
+    backfill_gaps_parser.add_argument(
+        "--from-date", type=_parse_date, default=date(2025, 6, 1),
+        help="Earliest date to scan for gaps (default: 2025-06-01)",
+    )
+    backfill_gaps_parser.add_argument(
+        "--schedule", type=int, metavar="SECONDS",
+        help="Run continuously, sleeping SECONDS between gap-fill scans.",
+    )
+    backfill_gaps_parser.set_defaults(func=bars_backfill_gaps)
 
     return parser
 

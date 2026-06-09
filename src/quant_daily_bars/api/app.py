@@ -18,8 +18,10 @@ from quant_daily_bars.api.readiness import (
 from quant_daily_bars.api.bars import (
     BarListParams,
     IngestRunListParams,
+    get_bar_date_range,
     get_bar_summary,
     get_ingest_run,
+    get_latest_ingest_run,
     get_missing_bars,
     list_bars,
     list_ingest_runs,
@@ -34,9 +36,11 @@ log = logging.getLogger(SERVICE_NAME)
 ReadinessCheck = Callable[[], Union[ReadinessStatus, Dict[str, Any]]]
 BarList = Callable[[BarListParams], Dict[str, Any]]
 BarSummary = Callable[[str], Optional[Dict[str, Any]]]
+BarDateRange = Callable[[], Optional[Dict[str, Any]]]
 TickersCoverage = Callable[[], Dict[str, Any]]
 IngestRuns = Callable[[IngestRunListParams], Dict[str, Any]]
 IngestRunDetail = Callable[[int], Optional[Dict[str, Any]]]
+IngestLatest = Callable[[], Optional[Dict[str, Any]]]
 MissingBars = Callable[..., Dict[str, Any]]
 
 VALID_RUN_STATUSES = frozenset(("running", "completed", "failed"))
@@ -118,9 +122,11 @@ def create_app(
     readiness_check: ReadinessCheck = check_database_readiness,
     bar_list: BarList = list_bars,
     bar_summary: BarSummary = get_bar_summary,
+    bar_date_range_fn: BarDateRange = get_bar_date_range,
     tickers_coverage: TickersCoverage = list_tickers_coverage,
     ingest_runs: IngestRuns = list_ingest_runs,
     ingest_run_detail: IngestRunDetail = get_ingest_run,
+    ingest_latest: IngestLatest = get_latest_ingest_run,
     missing_bars_fn: MissingBars = get_missing_bars,
 ) -> Bottle:
     api = Bottle()
@@ -208,6 +214,16 @@ def create_app(
             return _not_found(f"no bars for ticker {ticker}")
         return result
 
+    @api.get("/bars/date-range")
+    def bars_date_range_route() -> dict:
+        try:
+            result = bar_date_range_fn()
+        except Exception as exc:
+            return _server_error(exc)
+        if result is None:
+            return _not_found("no bars in database")
+        return result
+
     @api.get("/bars/coverage")
     def bars_coverage_route() -> dict:
         try:
@@ -250,6 +266,16 @@ def create_app(
         if result is None:
             return _not_found("ingest run not found")
         return result
+
+    @api.get("/ingest/latest")
+    def ingest_latest_route() -> dict:
+        try:
+            result = ingest_latest()
+        except Exception as exc:
+            return _server_error(exc)
+        if result is None:
+            return _not_found("no ingest runs found")
+        return {"status": "ok", "latest": result}
 
     # -- missing bars ----------------------------------------------------
 

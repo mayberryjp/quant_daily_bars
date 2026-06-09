@@ -7,7 +7,6 @@ Performs no database writes.
 
 from __future__ import annotations
 
-import collections
 import logging
 import time
 from datetime import date, datetime, timezone
@@ -22,6 +21,7 @@ from quant_daily_bars.vendors.polygon.errors import (
     PolygonServerError,
 )
 from quant_daily_bars.vendors.polygon.models import AggregatesPage
+from quant_daily_bars.vendors.polygon.rate_limiter import SharedRateLimiter
 from quant_daily_bars.vendors.polygon.transport import (
     Transport,
     UrllibTransport,
@@ -47,17 +47,30 @@ class PolygonBarsClient:
         *,
         transport: Transport | None = None,
         sleep: SleepFunc | None = None,
+        rate_limiter: SharedRateLimiter | None = None,
     ) -> None:
         self.config = config
         self._transport = transport or UrllibTransport()
         self._sleep = sleep or time.sleep
-        self._clock = time.monotonic
-        # Sliding window: track timestamps of the last N requests
-        self._request_timestamps: collections.deque[float] = collections.deque()
+        self._rate_limiter = rate_limiter or SharedRateLimiter(
+            rpm=config.rate_limit_rpm,
+            sleep=self._sleep,
+        )
 
     @classmethod
-    def from_env(cls, *, transport: Transport | None = None, sleep: SleepFunc | None = None) -> "PolygonBarsClient":
-        return cls(PolygonConfig.from_env(require_api_key=True), transport=transport, sleep=sleep)
+    def from_env(
+        cls,
+        *,
+        transport: Transport | None = None,
+        sleep: SleepFunc | None = None,
+        rate_limiter: SharedRateLimiter | None = None,
+    ) -> "PolygonBarsClient":
+        return cls(
+            PolygonConfig.from_env(require_api_key=True),
+            transport=transport,
+            sleep=sleep,
+            rate_limiter=rate_limiter,
+        )
 
     def get_daily_bars(
         self,
@@ -111,26 +124,8 @@ class PolygonBarsClient:
             next_url = page.next_url
 
     def _throttle(self) -> None:
-        """Enforce sliding-window rate limit (default: 5 req/60s for Polygon free tier)."""
-        rpm = self.config.rate_limit_rpm
-        if rpm <= 0:
-            return
-        window = 60.0
-        now = self._clock()
-        # Discard timestamps older than the window
-        while self._request_timestamps and now - self._request_timestamps[0] >= window:
-            self._request_timestamps.popleft()
-        if len(self._request_timestamps) >= rpm:
-            oldest = self._request_timestamps[0]
-            wait = window - (now - oldest) + 0.1  # +0.1s safety margin
-            if wait > 0:
-                log.info("rate limit: %d/%d requests in window, waiting %.1fs", len(self._request_timestamps), rpm, wait)
-                self._sleep(wait)
-                # Re-check after sleeping
-                now = self._clock()
-                while self._request_timestamps and now - self._request_timestamps[0] >= window:
-                    self._request_timestamps.popleft()
-        self._request_timestamps.append(self._clock())
+        """Enforce shared cross-process rate limit."""
+        self._rate_limiter.throttle()
 
     def _request_json(self, url: str) -> dict[str, object]:
         max_attempts = self.config.retry_count + 1

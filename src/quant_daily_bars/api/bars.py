@@ -226,6 +226,33 @@ def get_ingest_run(run_id: int) -> dict[str, Any] | None:
     return _run_to_item(row)
 
 
+def get_latest_ingest_run() -> dict[str, Any] | None:
+    from sqlalchemy import text
+
+    engine = _engine()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT r.id, s.vendor_name, r.mode, r.status,
+                           r.requested_start_date, r.requested_end_date,
+                           r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
+                           r.bars_upserted, r.errors, r.error_message,
+                           r.duration_seconds, r.started_at, r.finished_at
+                    FROM market_data.vendor_bar_runs r
+                    JOIN market_data.vendor_bar_sources s ON s.id = r.vendor_source_id
+                    ORDER BY r.id DESC
+                    LIMIT 1
+                """),
+            ).mappings().first()
+    finally:
+        engine.dispose()
+
+    if row is None:
+        return None
+    return _run_to_item(row)
+
+
 def get_missing_bars(ticker: str | None = None, limit: int = 100, offset: int = 0) -> dict[str, Any]:
     from sqlalchemy import text
 
@@ -265,6 +292,33 @@ def get_missing_bars(ticker: str | None = None, limit: int = 100, offset: int = 
         for row in rows
     ]
     return {"items": items, "limit": limit, "offset": offset, "count": len(items)}
+
+
+def get_bar_date_range() -> dict[str, Any] | None:
+    from sqlalchemy import text
+
+    engine = _engine()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT MIN(bar_date) AS first_date,
+                           MAX(bar_date) AS last_date,
+                           COUNT(*) AS total_bars
+                    FROM market_data.daily_bars
+                """)
+            ).mappings().first()
+    finally:
+        engine.dispose()
+
+    if row is None or row["first_date"] is None:
+        return None
+
+    return {
+        "first_date": str(row["first_date"]),
+        "last_date": str(row["last_date"]),
+        "total_bars": int(row["total_bars"]),
+    }
 
 
 def _bar_to_item(row: Any) -> dict[str, Any]:
