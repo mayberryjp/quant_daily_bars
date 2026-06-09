@@ -18,6 +18,7 @@ from quant_daily_bars.api.readiness import (
 from quant_daily_bars.api.bars import (
     BarListParams,
     IngestRunListParams,
+    get_backfill_progress,
     get_bar_date_range,
     get_bar_summary,
     get_ingest_run,
@@ -42,6 +43,7 @@ IngestRuns = Callable[[IngestRunListParams], Dict[str, Any]]
 IngestRunDetail = Callable[[int], Optional[Dict[str, Any]]]
 IngestLatest = Callable[[], Optional[Dict[str, Any]]]
 MissingBars = Callable[..., Dict[str, Any]]
+BackfillProgress = Callable[..., Dict[str, Any]]
 
 VALID_RUN_STATUSES = frozenset(("running", "completed", "failed"))
 VALID_ADJUSTMENT_TYPES = frozenset(("unadjusted", "split_adjusted"))
@@ -128,6 +130,7 @@ def create_app(
     ingest_run_detail: IngestRunDetail = get_ingest_run,
     ingest_latest: IngestLatest = get_latest_ingest_run,
     missing_bars_fn: MissingBars = get_missing_bars,
+    backfill_progress_fn: BackfillProgress = get_backfill_progress,
 ) -> Bottle:
     api = Bottle()
     api.title = SERVICE_NAME
@@ -228,6 +231,14 @@ def create_app(
     def bars_coverage_route() -> dict:
         try:
             return tickers_coverage()
+        except Exception as exc:
+            return _server_error(exc)
+
+    @api.get("/bars/backfill-progress")
+    def bars_backfill_progress_route() -> dict:
+        from_date = request.query.get("from_date") or "2025-06-01"
+        try:
+            return backfill_progress_fn(from_date=from_date)
         except Exception as exc:
             return _server_error(exc)
 

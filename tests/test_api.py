@@ -121,6 +121,23 @@ def _fake_bar_date_range():
     }
 
 
+def _fake_backfill_progress(from_date="2025-06-01"):
+    return {
+        "from_date": from_date,
+        "to_date": "2025-12-31",
+        "weekdays_in_range": 150,
+        "active_symbols": 10,
+        "total_bars_expected": 1500,
+        "total_bars_have": 900,
+        "total_bars_missing": 600,
+        "percent_complete": 60.0,
+        "symbols_complete": 3,
+        "symbols_partial": 5,
+        "symbols_empty": 2,
+        "by_symbol": [],
+    }
+
+
 def _fake_ingest_latest():
     return {
         "run_id": 1,
@@ -152,6 +169,7 @@ def _make_client():
         ingest_run_detail=_fake_ingest_run_detail,
         ingest_latest=_fake_ingest_latest,
         missing_bars_fn=_fake_missing_bars,
+        backfill_progress_fn=_fake_backfill_progress,
     )
     return TestClient(app)
 
@@ -304,3 +322,25 @@ class TestBarDateRange:
         client = TestClient(app)
         resp = client.get("/bars/date-range")
         assert resp.status_code == 404
+
+
+class TestBackfillProgress:
+    def test_backfill_progress(self):
+        client = _make_client()
+        resp = client.get("/bars/backfill-progress")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_bars_expected"] == 1500
+        assert data["total_bars_have"] == 900
+        assert data["total_bars_missing"] == 600
+        assert data["percent_complete"] == 60.0
+        assert data["symbols_complete"] == 3
+        assert data["symbols_partial"] == 5
+        assert data["symbols_empty"] == 2
+
+    def test_backfill_progress_custom_date(self):
+        client = _make_client()
+        resp = client.get("/bars/backfill-progress", params={"from_date": "2024-01-01"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["from_date"] == "2024-01-01"
