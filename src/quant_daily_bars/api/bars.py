@@ -304,7 +304,8 @@ def get_bar_date_range() -> dict[str, Any] | None:
                 text("""
                     SELECT MIN(bar_date) AS first_date,
                            MAX(bar_date) AS last_date,
-                           COUNT(*) AS total_bars
+                           COUNT(*) AS total_bars,
+                           COUNT(DISTINCT bar_date) AS unique_days
                     FROM market_data.daily_bars
                 """)
             ).mappings().first()
@@ -318,6 +319,7 @@ def get_bar_date_range() -> dict[str, Any] | None:
         "first_date": str(row["first_date"]),
         "last_date": str(row["last_date"]),
         "total_bars": int(row["total_bars"]),
+        "unique_days": int(row["unique_days"]),
     }
 
 

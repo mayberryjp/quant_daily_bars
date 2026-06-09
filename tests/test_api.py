@@ -117,6 +117,7 @@ def _fake_bar_date_range():
         "first_date": "2024-01-02",
         "last_date": "2024-06-01",
         "total_bars": 1250,
+        "unique_days": 105,
     }
 
 
@@ -293,6 +294,7 @@ class TestBarDateRange:
         assert data["first_date"] == "2024-01-02"
         assert data["last_date"] == "2024-06-01"
         assert data["total_bars"] == 1250
+        assert data["unique_days"] == 105
 
     def test_date_range_empty(self):
         app = create_app(
