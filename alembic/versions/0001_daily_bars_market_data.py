@@ -153,4 +153,5 @@ def downgrade() -> None:
     op.drop_table("daily_bars", schema="market_data")
     op.drop_table("vendor_bar_runs", schema="market_data")
     op.drop_table("vendor_bar_sources", schema="market_data")
-    op.execute("DROP SCHEMA IF EXISTS market_data CASCADE")
+    # Do NOT drop the market_data schema — it may be shared with other services.
+    # The schema is created with IF NOT EXISTS in upgrade and is safe to leave.

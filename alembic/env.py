@@ -19,12 +19,20 @@ def _database_url() -> str:
     )
 
 
+# Use a dedicated version table so this repo's migrations don't collide
+# with quant_symbols (which uses the default public.alembic_version).
+VERSION_TABLE = "alembic_version_daily_bars"
+VERSION_TABLE_SCHEMA = "market_data"
+
+
 def run_migrations_offline() -> None:
     context.configure(
         url=_database_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        version_table=VERSION_TABLE,
+        version_table_schema=VERSION_TABLE_SCHEMA,
     )
 
     with context.begin_transaction():
@@ -42,7 +50,12 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            version_table=VERSION_TABLE,
+            version_table_schema=VERSION_TABLE_SCHEMA,
+        )
 
         with context.begin_transaction():
             context.run_migrations()

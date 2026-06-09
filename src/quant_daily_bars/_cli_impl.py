@@ -68,7 +68,7 @@ def db_verify(_args: argparse.Namespace) -> None:
     with engine.connect() as connection:
         connection.execute(text("SELECT 1")).scalar_one()
         schema_version = connection.execute(
-            text("SELECT version_num FROM alembic_version")
+            text("SELECT version_num FROM market_data.alembic_version_daily_bars")
         ).scalar_one()
         tables = connection.execute(
             text("""
