@@ -76,6 +76,7 @@ def db_verify(_args: argparse.Namespace) -> None:
                 FROM information_schema.tables
                 WHERE table_schema = 'market_data'
                   AND table_type = 'BASE TABLE'
+                  AND table_name != 'alembic_version_daily_bars'
                 ORDER BY table_name
             """)
         ).scalars().all()

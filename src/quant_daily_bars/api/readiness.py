@@ -83,6 +83,7 @@ def check_database_readiness(database_url: str | None = None) -> ReadinessStatus
                         FROM information_schema.tables
                         WHERE table_schema = 'market_data'
                           AND table_type = 'BASE TABLE'
+                          AND table_name != 'alembic_version_daily_bars'
                         ORDER BY table_name
                     """)
                 ).scalars().all()
