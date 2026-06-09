@@ -1,0 +1,6 @@
+services:
+  quant_daily_bars:
+    image: quant_daily_bars:latest
+    container_name: quant_daily_bars
+    stdin_open: true
+    tty: true
