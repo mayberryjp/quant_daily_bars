@@ -145,8 +145,8 @@ class DailyBarIngestJob:
             with self._engine.connect() as conn:
                 rows = conn.execute(
                     text("""
-                        SELECT id, ticker FROM symbol_master.symbols
-                        WHERE ticker = ANY(:tickers)
+                        SELECT id, canonical_ticker FROM symbol_master.symbols
+                        WHERE canonical_ticker = ANY(:tickers)
                     """),
                     {"tickers": options.tickers},
                 ).fetchall()
@@ -161,9 +161,9 @@ class DailyBarIngestJob:
             with self._engine.connect() as conn:
                 rows = conn.execute(
                     text("""
-                        SELECT id, ticker FROM symbol_master.symbols
-                        WHERE is_active = true
-                        ORDER BY ticker
+                        SELECT id, canonical_ticker FROM symbol_master.symbols
+                        WHERE active = true
+                        ORDER BY canonical_ticker
                     """)
                 ).fetchall()
                 return [IngestTarget(symbol_id=r[0], ticker=r[1]) for r in rows]
@@ -326,7 +326,7 @@ class DailyBarIngestJob:
                 # Resolve or synthesize symbol_id
                 with self._engine.begin() as conn:
                     row = conn.execute(
-                        text("SELECT id FROM symbol_master.symbols WHERE ticker = :ticker"),
+                        text("SELECT id FROM symbol_master.symbols WHERE canonical_ticker = :ticker"),
                         {"ticker": ticker},
                     ).fetchone()
                     if row is None:
