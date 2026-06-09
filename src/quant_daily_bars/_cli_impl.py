@@ -263,60 +263,49 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
         for sym_id, ticker in symbols:
             # Find dates we already have for this symbol in the range
             with engine.connect() as conn:
-                existing_dates = set(
-                    conn.execute(
-                        sa_text("""
-                            SELECT bar_date FROM market_data.daily_bars
-                            WHERE symbol_id = :symbol_id
-                              AND bar_date >= :start AND bar_date <= :end
-                              AND adjustment_type = 'unadjusted'
-                        """),
-                        {"symbol_id": sym_id, "start": gap_start, "end": yesterday},
-                    ).scalars().all()
-                )
+                existing_count = conn.execute(
+                    sa_text("""
+                        SELECT COUNT(*) FROM market_data.daily_bars
+                        WHERE symbol_id = :symbol_id
+                          AND bar_date >= :start AND bar_date <= :end
+                          AND adjustment_type = 'unadjusted'
+                    """),
+                    {"symbol_id": sym_id, "start": gap_start, "end": yesterday},
+                ).scalar_one()
 
             # Generate all weekdays in range (Mon-Fri) as candidate trading days
-            candidate_dates = []
-            d = gap_start
-            while d <= yesterday:
-                if d.weekday() < 5:  # Mon=0 .. Fri=4
-                    candidate_dates.append(d)
-                d += timedelta(days=1)
+            expected_weekdays = sum(
+                1 for i in range((yesterday - gap_start).days + 1)
+                if (gap_start + timedelta(days=i)).weekday() < 5
+            )
 
-            missing_dates = sorted(set(candidate_dates) - existing_dates)
-
-            if not missing_dates:
+            if existing_count >= expected_weekdays:
                 continue
 
             total_symbols_with_gaps += 1
+            missing_estimate = expected_weekdays - existing_count
+            log.info("%s: ~%d missing bars, fetching full range %s to %s", ticker, missing_estimate, gap_start, yesterday)
 
-            # Batch contiguous missing dates into ranges to minimize API calls
-            ranges = _contiguous_ranges(missing_dates)
-            log.info("%s: %d missing dates in %d range(s)", ticker, len(missing_dates), len(ranges))
-
-            for range_start, range_end in ranges:
-                options = IngestOptions(
-                    from_date=range_start,
-                    to_date=range_end,
-                    tickers=[ticker],
-                    adjustment_type="unadjusted",
-                    mode="backfill",
-                )
-                job = DailyBarIngestJob(engine=engine, client=client)
-                try:
-                    summary = job.run(options)
-                    total_gaps_filled += summary.bars_upserted
-                    log.info(
-                        "%s: filled %d bars for %s to %s",
-                        ticker, summary.bars_upserted, range_start, range_end,
-                    )
-                except (PolygonAuthError, PolygonRateLimitError) as exc:
-                    log.error("%s: API error filling gaps: %s", ticker, exc)
-                    if run_once:
-                        raise SystemExit(1) from exc
-                    break  # stop this symbol, try next cycle
-                except Exception as exc:
-                    log.error("%s: error filling gaps %s-%s: %s", ticker, range_start, range_end, exc)
+            # Single API call for the entire range — Polygon returns only bars that exist
+            options = IngestOptions(
+                from_date=gap_start,
+                to_date=yesterday,
+                tickers=[ticker],
+                adjustment_type="unadjusted",
+                mode="backfill",
+            )
+            job = DailyBarIngestJob(engine=engine, client=client)
+            try:
+                summary = job.run(options)
+                total_gaps_filled += summary.bars_upserted
+                log.info("%s: upserted %d bars", ticker, summary.bars_upserted)
+            except (PolygonAuthError, PolygonRateLimitError) as exc:
+                log.error("%s: API error filling gaps: %s", ticker, exc)
+                if run_once:
+                    raise SystemExit(1) from exc
+                break  # stop processing, try next cycle
+            except Exception as exc:
+                log.error("%s: error filling gaps: %s", ticker, exc)
 
         print(
             f"backfill_gaps  symbols_with_gaps={total_symbols_with_gaps}  "
