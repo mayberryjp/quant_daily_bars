@@ -45,3 +45,9 @@ class TestCLIParser:
         args = parser.parse_args(["bars", "run-summary", "--latest"])
         assert args.bars_command == "run-summary"
         assert args.latest is True
+
+    def test_scheduled_mode_no_from_date(self):
+        parser = build_parser()
+        args = parser.parse_args(["bars", "ingest", "--schedule", "86400"])
+        assert args.from_date is None
+        assert args.schedule == 86400

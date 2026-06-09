@@ -116,24 +116,36 @@ def bars_ingest(args: argparse.Namespace) -> None:
         PolygonRateLimitError,
     )
 
-    from_date = args.from_date
-    to_date = args.to_date or date.today()
-    tickers = [t.strip() for t in args.tickers.split(",")] if args.tickers else None
-
-    options = IngestOptions(
-        from_date=from_date,
-        to_date=to_date,
-        tickers=tickers,
-        adjustment_type=args.adjustment_type,
-        mode=args.mode,
-        fixture_path=args.fixture,
-        dry_run=args.dry_run,
-    )
-
     interval = getattr(args, "schedule", None)
     run_once = interval is None
 
+    # In one-shot mode, --from-date is required.
+    if run_once and args.from_date is None and not args.fixture:
+        raise SystemExit("error: --from-date is required for one-shot ingestion (or use --schedule for daily auto-ingest)")
+
     while True:
+        # In scheduled mode, automatically compute yesterday's date each cycle.
+        if args.from_date is not None:
+            from_date = args.from_date
+        else:
+            from_date = date.today() - timedelta(days=1)
+        to_date = args.to_date or from_date
+        tickers = [t.strip() for t in args.tickers.split(",")] if args.tickers else None
+
+        options = IngestOptions(
+            from_date=from_date,
+            to_date=to_date,
+            tickers=tickers,
+            adjustment_type=args.adjustment_type,
+            mode="incremental" if interval and not args.from_date else args.mode,
+            fixture_path=args.fixture,
+            dry_run=args.dry_run,
+        )
+
+        logging.getLogger(__name__).info(
+            "ingesting bars  from=%s  to=%s  mode=%s", from_date, to_date, options.mode,
+        )
+
         engine = None if args.dry_run and not args.fixture else _engine()
         client = None
         if not args.fixture:
@@ -239,8 +251,8 @@ def build_parser() -> argparse.ArgumentParser:
     bars_subparsers = bars_parser.add_subparsers(dest="bars_command", required=True)
 
     ingest_parser = bars_subparsers.add_parser("ingest")
-    ingest_parser.add_argument("--from-date", type=_parse_date, required=True, help="Start date (YYYY-MM-DD)")
-    ingest_parser.add_argument("--to-date", type=_parse_date, default=None, help="End date (YYYY-MM-DD, default: today)")
+    ingest_parser.add_argument("--from-date", type=_parse_date, default=None, help="Start date (YYYY-MM-DD). Required for one-shot; defaults to yesterday in scheduled mode.")
+    ingest_parser.add_argument("--to-date", type=_parse_date, default=None, help="End date (YYYY-MM-DD, default: same as from-date)")
     ingest_parser.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: all active)")
     ingest_parser.add_argument("--adjustment-type", choices=("unadjusted", "split_adjusted"), default="unadjusted")
     ingest_parser.add_argument("--mode", choices=("backfill", "incremental"), default="backfill")
@@ -248,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_parser.add_argument("--dry-run", action="store_true", help="Parse bars without database writes")
     ingest_parser.add_argument(
         "--schedule", type=int, metavar="SECONDS",
-        help="Run continuously, sleeping SECONDS between ingests (e.g. 86400 for daily)",
+        help="Run continuously, sleeping SECONDS between ingests. Automatically ingests previous day's bars each cycle.",
     )
     ingest_parser.set_defaults(func=bars_ingest)
 
