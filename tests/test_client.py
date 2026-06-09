@@ -47,7 +47,7 @@ def _bar_payload(ticker="AAPL"):
 
 class TestPolygonBarsClient:
     def _make_client(self, responses):
-        config = PolygonConfig(api_key="test-key", page_delay_seconds=0.0)
+        config = PolygonConfig(api_key="test-key", rate_limit_rpm=0)
         transport = MockTransport(responses=responses)
         return PolygonBarsClient(config, transport=transport, sleep=lambda _: None)
 

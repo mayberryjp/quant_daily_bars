@@ -7,6 +7,7 @@ Performs no database writes.
 
 from __future__ import annotations
 
+import collections
 import logging
 import time
 from datetime import date, datetime, timezone
@@ -50,6 +51,9 @@ class PolygonBarsClient:
         self.config = config
         self._transport = transport or UrllibTransport()
         self._sleep = sleep or time.sleep
+        self._clock = time.monotonic
+        # Sliding window: track timestamps of the last N requests
+        self._request_timestamps: collections.deque[float] = collections.deque()
 
     @classmethod
     def from_env(cls, *, transport: Transport | None = None, sleep: SleepFunc | None = None) -> "PolygonBarsClient":
@@ -97,10 +101,6 @@ class PolygonBarsClient:
         pages_seen = 0
 
         while next_url:
-            if pages_seen > 0 and self.config.page_delay_seconds > 0:
-                log.info("throttling %.1fs before page %d", self.config.page_delay_seconds, pages_seen + 1)
-                self._sleep(self.config.page_delay_seconds)
-
             request_url = self._with_api_key(next_url)
             log.info("requesting page %d  url=%s", pages_seen + 1, self._redact_api_key(request_url))
             payload = self._request_json(request_url)
@@ -110,9 +110,32 @@ class PolygonBarsClient:
             pages_seen += 1
             next_url = page.next_url
 
+    def _throttle(self) -> None:
+        """Enforce sliding-window rate limit (default: 5 req/60s for Polygon free tier)."""
+        rpm = self.config.rate_limit_rpm
+        if rpm <= 0:
+            return
+        window = 60.0
+        now = self._clock()
+        # Discard timestamps older than the window
+        while self._request_timestamps and now - self._request_timestamps[0] >= window:
+            self._request_timestamps.popleft()
+        if len(self._request_timestamps) >= rpm:
+            oldest = self._request_timestamps[0]
+            wait = window - (now - oldest) + 0.1  # +0.1s safety margin
+            if wait > 0:
+                log.info("rate limit: %d/%d requests in window, waiting %.1fs", len(self._request_timestamps), rpm, wait)
+                self._sleep(wait)
+                # Re-check after sleeping
+                now = self._clock()
+                while self._request_timestamps and now - self._request_timestamps[0] >= window:
+                    self._request_timestamps.popleft()
+        self._request_timestamps.append(self._clock())
+
     def _request_json(self, url: str) -> dict[str, object]:
         max_attempts = self.config.retry_count + 1
         for attempt in range(max_attempts):
+            self._throttle()
             response = self._transport.request(
                 "GET",
                 url,

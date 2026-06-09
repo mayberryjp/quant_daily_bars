@@ -147,8 +147,9 @@ python3 -m quant_daily_bars.cli bars run-summary --latest
 ## Vendor Assumptions
 
 - **Polygon.io** is the primary vendor via `/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}`.
-- The free tier is rate-limited to 5 requests/minute. The client uses configurable
-  `MASSIVE_PAGE_DELAY_SECONDS` (default 12s) and exponential backoff on 429s.
+- The free tier is rate-limited to 5 requests/minute. The client enforces this
+  with a sliding-window rate limiter (`MASSIVE_RATE_LIMIT_RPM`, default 5) that
+  waits automatically before exceeding the limit.
 - Bar timestamps are millisecond Unix epochs in UTC. The client converts them to
   `date` objects for the `bar_date` column.
 
