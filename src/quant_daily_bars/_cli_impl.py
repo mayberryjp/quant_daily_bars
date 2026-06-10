@@ -259,32 +259,83 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
 
         total_gaps_filled = 0
         total_symbols_with_gaps = 0
+        total_symbols_skipped = 0
+
+        # Build trading calendar from existing data: dates where >=5 symbols have bars
+        # are considered confirmed trading days. This excludes holidays automatically.
+        with engine.connect() as conn:
+            trading_days = set(
+                conn.execute(
+                    sa_text("""
+                        SELECT bar_date
+                        FROM market_data.daily_bars
+                        WHERE bar_date >= :start AND bar_date <= :end
+                          AND adjustment_type = 'unadjusted'
+                        GROUP BY bar_date
+                        HAVING COUNT(DISTINCT symbol_id) >= 5
+                        ORDER BY bar_date
+                    """),
+                    {"start": gap_start, "end": yesterday},
+                ).scalars().all()
+            )
+
+        # If we have no trading calendar yet (first run), fall back to weekday estimate
+        use_calendar = len(trading_days) > 0
 
         for sym_id, ticker in symbols:
-            # Find dates we already have for this symbol in the range
             with engine.connect() as conn:
-                existing_count = conn.execute(
+                row = conn.execute(
                     sa_text("""
-                        SELECT COUNT(*) FROM market_data.daily_bars
+                        SELECT COUNT(*) AS cnt,
+                               MIN(bar_date) AS first_date
+                        FROM market_data.daily_bars
                         WHERE symbol_id = :symbol_id
                           AND bar_date >= :start AND bar_date <= :end
                           AND adjustment_type = 'unadjusted'
                     """),
                     {"symbol_id": sym_id, "start": gap_start, "end": yesterday},
-                ).scalar_one()
+                ).mappings().first()
 
-            # Generate all weekdays in range (Mon-Fri) as candidate trading days
-            expected_weekdays = sum(
-                1 for i in range((yesterday - gap_start).days + 1)
-                if (gap_start + timedelta(days=i)).weekday() < 5
-            )
+            existing_count = row["cnt"]
+            first_bar_date = row["first_date"]
 
-            if existing_count >= expected_weekdays:
+            if use_calendar and first_bar_date is not None:
+                # Only expect bars on trading days from this symbol's first bar onward
+                expected = sum(1 for d in trading_days if d >= first_bar_date)
+            elif use_calendar and first_bar_date is None:
+                # Symbol has 0 bars. Check if we already attempted a backfill for it.
+                with engine.connect() as conn:
+                    already_attempted = conn.execute(
+                        sa_text("""
+                            SELECT COUNT(*) FROM market_data.vendor_bar_runs r
+                            WHERE r.mode = 'backfill'
+                              AND r.status = 'completed'
+                              AND r.requested_start_date <= :start
+                              AND r.requested_end_date >= :end
+                        """),
+                        {"start": gap_start, "end": yesterday},
+                    ).scalar_one()
+                if already_attempted > 0:
+                    # Already tried and Polygon returned nothing — skip
+                    total_symbols_skipped += 1
+                    continue
+                expected = 1  # force one attempt for never-fetched symbols
+            else:
+                # No calendar yet (first run) — fall back to weekday estimate
+                expected = sum(
+                    1 for i in range((yesterday - gap_start).days + 1)
+                    if (gap_start + timedelta(days=i)).weekday() < 5
+                )
+
+            if existing_count >= expected:
+                total_symbols_skipped += 1
                 continue
 
             total_symbols_with_gaps += 1
-            missing_estimate = expected_weekdays - existing_count
-            log.info("%s: ~%d missing bars, fetching full range %s to %s", ticker, missing_estimate, gap_start, yesterday)
+            log.info(
+                "%s: have %d/%d bars, fetching %s to %s",
+                ticker, existing_count, expected, gap_start, yesterday,
+            )
 
             # Single API call for the entire range — Polygon returns only bars that exist
             options = IngestOptions(
@@ -309,6 +360,7 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
 
         print(
             f"backfill_gaps  symbols_with_gaps={total_symbols_with_gaps}  "
+            f"symbols_skipped={total_symbols_skipped}  "
             f"bars_filled={total_gaps_filled}  range={gap_start}..{yesterday}"
         )
 

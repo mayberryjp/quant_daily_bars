@@ -14,7 +14,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_RETRY_COUNT = 3
 DEFAULT_BACKOFF_SECONDS = 0.5
 DEFAULT_BACKOFF_MULTIPLIER = 2.0
-DEFAULT_RATE_LIMIT_RPM = 5  # Polygon free tier: 5 requests per minute
+DEFAULT_RATE_LIMIT_RPM = 30
 
 
 def _env_value(name: str) -> str | None:

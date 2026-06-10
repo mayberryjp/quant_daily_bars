@@ -125,7 +125,7 @@ def _fake_backfill_progress(from_date="2025-06-01"):
     return {
         "from_date": from_date,
         "to_date": "2025-12-31",
-        "weekdays_in_range": 150,
+        "trading_days_in_range": 150,
         "active_symbols": 10,
         "total_bars_expected": 1500,
         "total_bars_have": 900,

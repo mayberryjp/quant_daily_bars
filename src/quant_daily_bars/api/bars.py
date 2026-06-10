@@ -330,30 +330,44 @@ def get_backfill_progress(from_date: str = "2025-06-01") -> dict[str, Any]:
     start = date.fromisoformat(from_date)
     yesterday = date.today() - timedelta(days=1)
 
-    # Count weekdays in range
-    expected_weekdays = 0
-    d = start
-    while d <= yesterday:
-        if d.weekday() < 5:
-            expected_weekdays += 1
-        d += timedelta(days=1)
-
     engine = _engine()
     try:
         with engine.connect() as conn:
+            # Build trading calendar: dates where >=5 symbols have bars
+            trading_days_rows = conn.execute(
+                text("""
+                    SELECT bar_date
+                    FROM market_data.daily_bars
+                    WHERE bar_date >= :start AND bar_date <= :end
+                      AND adjustment_type = 'unadjusted'
+                    GROUP BY bar_date
+                    HAVING COUNT(DISTINCT symbol_id) >= 5
+                    ORDER BY bar_date
+                """),
+                {"start": start, "end": yesterday},
+            ).scalars().all()
+            trading_days = set(trading_days_rows)
+            trading_day_count = len(trading_days)
+
+            # Fall back to weekday count if no calendar yet
+            if trading_day_count == 0:
+                trading_day_count = sum(
+                    1 for i in range((yesterday - start).days + 1)
+                    if (start + timedelta(days=i)).weekday() < 5
+                )
+
             # Active symbols
             active_symbols = conn.execute(
                 text("SELECT COUNT(*) FROM symbol_master.symbols WHERE active = true")
             ).scalar_one()
 
-            # Per-symbol progress: how many bars each symbol has in range
+            # Per-symbol: count bars and first bar date
             per_symbol = conn.execute(
                 text("""
                     SELECT s.canonical_ticker AS ticker,
                            s.id AS symbol_id,
                            COUNT(d.bar_date) AS bars_have,
-                           :expected_days AS bars_expected,
-                           :expected_days - COUNT(d.bar_date) AS bars_missing
+                           MIN(d.bar_date) AS first_bar_date
                     FROM symbol_master.symbols s
                     LEFT JOIN market_data.daily_bars d
                         ON d.symbol_id = s.id
@@ -362,45 +376,68 @@ def get_backfill_progress(from_date: str = "2025-06-01") -> dict[str, Any]:
                        AND d.adjustment_type = 'unadjusted'
                     WHERE s.active = true
                     GROUP BY s.id, s.canonical_ticker
-                    ORDER BY bars_missing DESC, s.canonical_ticker
+                    ORDER BY s.canonical_ticker
                 """),
-                {"start": start, "end": yesterday, "expected_days": expected_weekdays},
+                {"start": start, "end": yesterday},
             ).mappings().all()
-
-            total_bars_have = sum(int(r["bars_have"]) for r in per_symbol)
     finally:
         engine.dispose()
 
-    total_expected = active_symbols * expected_weekdays
-    total_missing = total_expected - total_bars_have
-    pct = (total_bars_have / total_expected * 100) if total_expected > 0 else 0.0
+    # Compute per-symbol expected bars using trading calendar
+    results = []
+    total_bars_have = 0
+    total_expected = 0
+    symbols_complete = 0
+    symbols_partial = 0
+    symbols_empty = 0
 
-    symbols_complete = sum(1 for r in per_symbol if int(r["bars_missing"]) == 0)
-    symbols_partial = sum(1 for r in per_symbol if 0 < int(r["bars_have"]) < expected_weekdays)
-    symbols_empty = sum(1 for r in per_symbol if int(r["bars_have"]) == 0)
+    for r in per_symbol:
+        bars_have = int(r["bars_have"])
+        first_bar = r["first_bar_date"]
+        total_bars_have += bars_have
+
+        if trading_days and first_bar is not None:
+            # Only count trading days from this symbol's first bar onward
+            expected = sum(1 for d in trading_days if d >= first_bar)
+        else:
+            expected = trading_day_count
+
+        total_expected += expected
+        bars_missing = max(expected - bars_have, 0)
+
+        if bars_have == 0:
+            symbols_empty += 1
+        elif bars_have >= expected:
+            symbols_complete += 1
+        else:
+            symbols_partial += 1
+
+        results.append({
+            "ticker": r["ticker"],
+            "symbol_id": int(r["symbol_id"]),
+            "bars_have": bars_have,
+            "bars_expected": expected,
+            "bars_missing": bars_missing,
+        })
+
+    # Sort by most missing first
+    results.sort(key=lambda x: (-x["bars_missing"], x["ticker"]))
+
+    pct = (total_bars_have / total_expected * 100) if total_expected > 0 else 0.0
 
     return {
         "from_date": str(start),
         "to_date": str(yesterday),
-        "weekdays_in_range": expected_weekdays,
+        "trading_days_in_range": trading_day_count,
         "active_symbols": active_symbols,
         "total_bars_expected": total_expected,
         "total_bars_have": total_bars_have,
-        "total_bars_missing": total_missing,
+        "total_bars_missing": max(total_expected - total_bars_have, 0),
         "percent_complete": round(pct, 2),
         "symbols_complete": symbols_complete,
         "symbols_partial": symbols_partial,
         "symbols_empty": symbols_empty,
-        "by_symbol": [
-            {
-                "ticker": r["ticker"],
-                "symbol_id": int(r["symbol_id"]),
-                "bars_have": int(r["bars_have"]),
-                "bars_expected": expected_weekdays,
-                "bars_missing": int(r["bars_missing"]),
-            }
-            for r in per_symbol
-        ],
+        "by_symbol": results,
     }
 
 
