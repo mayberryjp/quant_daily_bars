@@ -7,7 +7,7 @@ from quant_daily_bars.api.testing import TestClient
 
 
 def _ok_readiness():
-    return ReadinessStatus(database="ok", schema_version="0001_daily_bars_market_data", tables=5)
+    return ReadinessStatus(database="ok", schema_version="0002_symbol_backfill_status", tables=6)
 
 
 def _fake_bar_list(params: BarListParams):
@@ -127,13 +127,12 @@ def _fake_backfill_progress(from_date="2025-06-01"):
         "to_date": "2025-12-31",
         "trading_days_in_range": 150,
         "active_symbols": 10,
-        "total_bars_expected": 1500,
-        "total_bars_have": 900,
-        "total_bars_missing": 600,
-        "percent_complete": 60.0,
-        "symbols_complete": 3,
-        "symbols_partial": 5,
-        "symbols_empty": 2,
+        "symbols_queried": 7,
+        "symbols_not_queried": 3,
+        "symbols_with_bars": 5,
+        "symbols_no_bars": 5,
+        "total_bars_ingested": 900,
+        "percent_symbols_queried": 70.0,
         "by_symbol": [],
     }
 
@@ -190,7 +189,7 @@ class TestHealth:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["database"] == "ok"
-        assert data["tables"] == 5
+        assert data["tables"] == 6
 
     def test_ready_failure(self):
         def _fail():
@@ -330,13 +329,12 @@ class TestBackfillProgress:
         resp = client.get("/bars/backfill-progress")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["total_bars_expected"] == 1500
-        assert data["total_bars_have"] == 900
-        assert data["total_bars_missing"] == 600
-        assert data["percent_complete"] == 60.0
-        assert data["symbols_complete"] == 3
-        assert data["symbols_partial"] == 5
-        assert data["symbols_empty"] == 2
+        assert data["active_symbols"] == 10
+        assert data["symbols_queried"] == 7
+        assert data["symbols_not_queried"] == 3
+        assert data["symbols_with_bars"] == 5
+        assert data["total_bars_ingested"] == 900
+        assert data["percent_symbols_queried"] == 70.0
 
     def test_backfill_progress_custom_date(self):
         client = _make_client()

@@ -10,11 +10,12 @@ from datetime import date, timedelta
 from pathlib import Path
 
 
-EXPECTED_SCHEMA_VERSION = "0001_daily_bars_market_data"
+EXPECTED_SCHEMA_VERSION = "0002_symbol_backfill_status"
 EXPECTED_TABLES = (
     "corporate_actions",
     "daily_bars",
     "missing_bars",
+    "symbol_backfill_status",
     "vendor_bar_runs",
     "vendor_bar_sources",
 )
@@ -261,83 +262,28 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
         total_symbols_with_gaps = 0
         total_symbols_skipped = 0
 
-        # Build trading calendar from existing data: dates where >=5 symbols have bars
-        # are considered confirmed trading days. This excludes holidays automatically.
-        with engine.connect() as conn:
-            trading_days = set(
-                conn.execute(
-                    sa_text("""
-                        SELECT bar_date
-                        FROM market_data.daily_bars
-                        WHERE bar_date >= :start AND bar_date <= :end
-                          AND adjustment_type = 'unadjusted'
-                        GROUP BY bar_date
-                        HAVING COUNT(DISTINCT symbol_id) >= 5
-                        ORDER BY bar_date
-                    """),
-                    {"start": gap_start, "end": yesterday},
-                ).scalars().all()
-            )
-
-        # If we have no trading calendar yet (first run), fall back to weekday estimate
-        use_calendar = len(trading_days) > 0
-
         for sym_id, ticker in symbols:
+            # Check if already backfilled for this range
             with engine.connect() as conn:
-                row = conn.execute(
+                status_row = conn.execute(
                     sa_text("""
-                        SELECT COUNT(*) AS cnt,
-                               MIN(bar_date) AS first_date
-                        FROM market_data.daily_bars
+                        SELECT query_start_date, query_end_date, bars_returned
+                        FROM market_data.symbol_backfill_status
                         WHERE symbol_id = :symbol_id
-                          AND bar_date >= :start AND bar_date <= :end
-                          AND adjustment_type = 'unadjusted'
                     """),
-                    {"symbol_id": sym_id, "start": gap_start, "end": yesterday},
+                    {"symbol_id": sym_id},
                 ).mappings().first()
 
-            existing_count = row["cnt"]
-            first_bar_date = row["first_date"]
-
-            if use_calendar and first_bar_date is not None:
-                # Only expect bars on trading days from this symbol's first bar onward
-                expected = sum(1 for d in trading_days if d >= first_bar_date)
-            elif use_calendar and first_bar_date is None:
-                # Symbol has 0 bars. Check if we already attempted a backfill for it.
-                with engine.connect() as conn:
-                    already_attempted = conn.execute(
-                        sa_text("""
-                            SELECT COUNT(*) FROM market_data.vendor_bar_runs r
-                            WHERE r.mode = 'backfill'
-                              AND r.status = 'completed'
-                              AND r.requested_start_date <= :start
-                              AND r.requested_end_date >= :end
-                        """),
-                        {"start": gap_start, "end": yesterday},
-                    ).scalar_one()
-                if already_attempted > 0:
-                    # Already tried and Polygon returned nothing — skip
+            if status_row is not None:
+                # Already queried — skip if the tracked range covers our range
+                if status_row["query_start_date"] <= gap_start and status_row["query_end_date"] >= yesterday:
                     total_symbols_skipped += 1
                     continue
-                expected = 1  # force one attempt for never-fetched symbols
-            else:
-                # No calendar yet (first run) — fall back to weekday estimate
-                expected = sum(
-                    1 for i in range((yesterday - gap_start).days + 1)
-                    if (gap_start + timedelta(days=i)).weekday() < 5
-                )
-
-            if existing_count >= expected:
-                total_symbols_skipped += 1
-                continue
 
             total_symbols_with_gaps += 1
-            log.info(
-                "%s: have %d/%d bars, fetching %s to %s",
-                ticker, existing_count, expected, gap_start, yesterday,
-            )
+            log.info("%s: fetching %s to %s", ticker, gap_start, yesterday)
 
-            # Single API call for the entire range — Polygon returns only bars that exist
+            # Single API call for the entire range
             options = IngestOptions(
                 from_date=gap_start,
                 to_date=yesterday,
@@ -349,6 +295,30 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
             try:
                 summary = job.run(options)
                 total_gaps_filled += summary.bars_upserted
+
+                # Record backfill status
+                with engine.connect() as conn:
+                    conn.execute(
+                        sa_text("""
+                            INSERT INTO market_data.symbol_backfill_status
+                                (symbol_id, ticker, query_start_date, query_end_date, bars_returned, last_queried_at)
+                            VALUES (:symbol_id, :ticker, :start, :end, :bars, now())
+                            ON CONFLICT (symbol_id) DO UPDATE SET
+                                query_start_date = LEAST(market_data.symbol_backfill_status.query_start_date, :start),
+                                query_end_date = GREATEST(market_data.symbol_backfill_status.query_end_date, :end),
+                                bars_returned = :bars,
+                                last_queried_at = now()
+                        """),
+                        {
+                            "symbol_id": sym_id,
+                            "ticker": ticker,
+                            "start": gap_start,
+                            "end": yesterday,
+                            "bars": summary.bars_upserted,
+                        },
+                    )
+                    conn.commit()
+
                 log.info("%s: upserted %d bars", ticker, summary.bars_upserted)
             except (PolygonAuthError, PolygonRateLimitError) as exc:
                 log.error("%s: API error filling gaps: %s", ticker, exc)
@@ -389,6 +359,83 @@ def _contiguous_ranges(dates: list[date]) -> list[tuple[date, date]]:
             prev = d
     ranges.append((start, prev))
     return ranges
+
+
+def bars_ingest_new_symbols(args: argparse.Namespace) -> None:
+    """Ingest bars only for active symbols that have no daily bars at all."""
+    from sqlalchemy import text as sa_text
+
+    from quant_daily_bars.ingest.job import DailyBarIngestJob, IngestOptions
+    from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
+    from quant_daily_bars.vendors.polygon.errors import (
+        PolygonAuthError,
+        PolygonConfigError,
+        PolygonRateLimitError,
+    )
+
+    log = logging.getLogger(__name__)
+    from_date = args.from_date
+    yesterday = date.today() - timedelta(days=1)
+    to_date = args.to_date or yesterday
+
+    engine = _engine()
+    try:
+        client = PolygonBarsClient.from_env()
+    except PolygonConfigError as exc:
+        print(f"ERROR: {exc}")
+        print("  Hint: set MASSIVE_API_KEY in your environment or .env file.")
+        raise SystemExit(1) from exc
+
+    # Find active symbols that have zero rows in daily_bars
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa_text("""
+                SELECT s.id, s.canonical_ticker
+                FROM symbol_master.symbols s
+                LEFT JOIN market_data.daily_bars db ON db.symbol_id = s.id
+                WHERE s.active = true
+                GROUP BY s.id, s.canonical_ticker
+                HAVING COUNT(db.symbol_id) = 0
+                ORDER BY s.canonical_ticker
+            """)
+        ).fetchall()
+
+    if not rows:
+        print("ingest_new_symbols  symbols_found=0  (all active symbols already have bars)")
+        return
+
+    tickers = [r[1] for r in rows]
+    log.info("found %d symbols with no bars: %s", len(tickers), ", ".join(tickers[:20]))
+
+    options = IngestOptions(
+        from_date=from_date,
+        to_date=to_date,
+        tickers=tickers,
+        adjustment_type=args.adjustment_type,
+        mode="backfill",
+    )
+
+    job = DailyBarIngestJob(engine=engine, client=client)
+    try:
+        summary = job.run(options)
+        print(summary.format_line())
+        if summary.warnings:
+            for w in summary.warnings:
+                print(f"  WARNING: {w}")
+        if summary.failures:
+            for f in summary.failures[:10]:
+                print(f"  FAILURE: {f}")
+        if summary.status == "failed":
+            raise SystemExit(1)
+    except PolygonAuthError as exc:
+        print(f"ERROR: {exc} (HTTP {exc.status_code})")
+        print("  Hint: your MASSIVE_API_KEY may be invalid or expired.")
+        raise SystemExit(1) from exc
+    except PolygonRateLimitError as exc:
+        print(f"ERROR: {exc} (HTTP {exc.status_code})")
+        if exc.retry_after_seconds is not None:
+            print(f"  Hint: retry after {exc.retry_after_seconds:.0f}s.")
+        raise SystemExit(1) from exc
 
 
 def bars_run_summary(args: argparse.Namespace) -> None:
@@ -467,6 +514,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run continuously, sleeping SECONDS between gap-fill scans.",
     )
     backfill_gaps_parser.set_defaults(func=bars_backfill_gaps)
+
+    ingest_new_parser = bars_subparsers.add_parser(
+        "ingest-new-symbols",
+        help="Ingest bars only for active symbols that have no daily bars at all.",
+    )
+    ingest_new_parser.add_argument(
+        "--from-date", type=_parse_date, required=True,
+        help="Start date for bar ingestion (YYYY-MM-DD)",
+    )
+    ingest_new_parser.add_argument(
+        "--to-date", type=_parse_date, default=None,
+        help="End date (YYYY-MM-DD, default: yesterday)",
+    )
+    ingest_new_parser.add_argument(
+        "--adjustment-type", choices=("unadjusted", "split_adjusted"), default="unadjusted",
+    )
+    ingest_new_parser.set_defaults(func=bars_ingest_new_symbols)
 
     return parser
 

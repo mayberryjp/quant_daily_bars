@@ -72,6 +72,29 @@ class TestCLIParser:
         args = parser.parse_args(["bars", "backfill-gaps", "--from-date", "2024-01-01"])
         assert args.from_date == date(2024, 1, 1)
 
+    def test_ingest_new_symbols_parses(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "bars", "ingest-new-symbols",
+            "--from-date", "2024-01-01",
+        ])
+        assert args.bars_command == "ingest-new-symbols"
+        assert args.from_date == date(2024, 1, 1)
+        assert args.to_date is None
+        assert args.adjustment_type == "unadjusted"
+
+    def test_ingest_new_symbols_with_to_date(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "bars", "ingest-new-symbols",
+            "--from-date", "2024-01-01",
+            "--to-date", "2024-06-30",
+            "--adjustment-type", "split_adjusted",
+        ])
+        assert args.from_date == date(2024, 1, 1)
+        assert args.to_date == date(2024, 6, 30)
+        assert args.adjustment_type == "split_adjusted"
+
 
 class TestContiguousRanges:
     def test_empty(self):
