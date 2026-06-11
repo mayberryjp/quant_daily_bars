@@ -133,7 +133,6 @@ def _fake_backfill_progress(from_date="2025-06-01"):
         "symbols_no_bars": 5,
         "total_bars_ingested": 900,
         "percent_symbols_queried": 70.0,
-        "by_symbol": [],
     }
 
 

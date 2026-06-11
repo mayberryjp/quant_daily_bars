@@ -353,70 +353,38 @@ def get_backfill_progress(from_date: str = "2025-06-01") -> dict[str, Any]:
             ).scalars().all()
             trading_day_count = len(trading_days_rows)
 
-            # Per-symbol: join symbols → backfill_status → daily_bars count
-            per_symbol = conn.execute(
+            # Aggregate backfill stats
+            backfill_stats = conn.execute(
                 text("""
-                    SELECT s.canonical_ticker AS ticker,
-                           s.id AS symbol_id,
-                           COUNT(d.bar_date) AS bars_have,
-                           b.query_start_date,
-                           b.query_end_date,
-                           b.bars_returned AS bars_returned_by_vendor,
-                           b.last_queried_at
+                    SELECT
+                        COUNT(*) FILTER (WHERE b.last_queried_at IS NOT NULL) AS symbols_queried,
+                        COUNT(*) FILTER (WHERE b.last_queried_at IS NULL) AS symbols_not_queried,
+                        COUNT(*) FILTER (WHERE bar_counts.bars_have > 0) AS symbols_with_bars,
+                        COUNT(*) FILTER (WHERE bar_counts.bars_have = 0 OR bar_counts.bars_have IS NULL) AS symbols_no_bars,
+                        COALESCE(SUM(bar_counts.bars_have), 0) AS total_bars_have
                     FROM symbol_master.symbols s
                     LEFT JOIN market_data.symbol_backfill_status b
                         ON b.symbol_id = s.id
-                    LEFT JOIN market_data.daily_bars d
-                        ON d.symbol_id = s.id
-                       AND d.bar_date >= :start
-                       AND d.bar_date <= :end
-                       AND d.adjustment_type = 'unadjusted'
+                    LEFT JOIN LATERAL (
+                        SELECT COUNT(d.bar_date) AS bars_have
+                        FROM market_data.daily_bars d
+                        WHERE d.symbol_id = s.id
+                          AND d.bar_date >= :start
+                          AND d.bar_date <= :end
+                          AND d.adjustment_type = 'unadjusted'
+                    ) bar_counts ON true
                     WHERE s.active = true
-                    GROUP BY s.id, s.canonical_ticker,
-                             b.query_start_date, b.query_end_date,
-                             b.bars_returned, b.last_queried_at
-                    ORDER BY s.canonical_ticker
                 """),
                 {"start": start, "end": yesterday},
-            ).mappings().all()
+            ).mappings().one()
     finally:
         engine.dispose()
 
-    symbols_queried = 0
-    symbols_not_queried = 0
-    symbols_with_bars = 0
-    symbols_no_bars = 0
-    total_bars_have = 0
-    results = []
-
-    for r in per_symbol:
-        bars_have = int(r["bars_have"])
-        total_bars_have += bars_have
-        queried = r["last_queried_at"] is not None
-
-        if queried:
-            symbols_queried += 1
-        else:
-            symbols_not_queried += 1
-
-        if bars_have > 0:
-            symbols_with_bars += 1
-        else:
-            symbols_no_bars += 1
-
-        results.append({
-            "ticker": r["ticker"],
-            "symbol_id": int(r["symbol_id"]),
-            "bars_have": bars_have,
-            "queried": queried,
-            "bars_returned_by_vendor": int(r["bars_returned_by_vendor"]) if r["bars_returned_by_vendor"] is not None else None,
-            "query_start_date": str(r["query_start_date"]) if r["query_start_date"] else None,
-            "query_end_date": str(r["query_end_date"]) if r["query_end_date"] else None,
-            "last_queried_at": r["last_queried_at"].isoformat() if r["last_queried_at"] else None,
-        })
-
-    # Sort: unqueried first, then by fewest bars
-    results.sort(key=lambda x: (x["queried"], x["bars_have"], x["ticker"]))
+    symbols_queried = int(backfill_stats["symbols_queried"])
+    symbols_not_queried = int(backfill_stats["symbols_not_queried"])
+    symbols_with_bars = int(backfill_stats["symbols_with_bars"])
+    symbols_no_bars = int(backfill_stats["symbols_no_bars"])
+    total_bars_have = int(backfill_stats["total_bars_have"])
 
     pct = (symbols_queried / active_symbols * 100) if active_symbols > 0 else 0.0
 
@@ -431,7 +399,6 @@ def get_backfill_progress(from_date: str = "2025-06-01") -> dict[str, Any]:
         "symbols_no_bars": symbols_no_bars,
         "total_bars_ingested": total_bars_have,
         "percent_symbols_queried": round(pct, 2),
-        "by_symbol": results,
     }
 
 
