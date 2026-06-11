@@ -6,7 +6,7 @@ import argparse
 import logging
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -361,8 +361,20 @@ def _contiguous_ranges(dates: list[date]) -> list[tuple[date, date]]:
     return ranges
 
 
-def bars_ingest_new_symbols(args: argparse.Namespace) -> None:
-    """Ingest bars only for active symbols that have no daily bars at all."""
+def _seconds_until_next_jst_1930() -> float:
+    """Return seconds until the next 19:30 JST."""
+    from datetime import timezone as tz
+
+    jst = tz(timedelta(hours=9))
+    now_jst = datetime.now(jst)
+    target = now_jst.replace(hour=19, minute=30, second=0, microsecond=0)
+    if target <= now_jst:
+        target += timedelta(days=1)
+    return (target - now_jst).total_seconds()
+
+
+def _run_ingest_new_symbols(args: argparse.Namespace) -> None:
+    """Core logic: find active symbols with no bars and ingest them."""
     from sqlalchemy import text as sa_text
 
     from quant_daily_bars.ingest.job import DailyBarIngestJob, IngestOptions
@@ -436,6 +448,28 @@ def bars_ingest_new_symbols(args: argparse.Namespace) -> None:
         if exc.retry_after_seconds is not None:
             print(f"  Hint: retry after {exc.retry_after_seconds:.0f}s.")
         raise SystemExit(1) from exc
+
+
+def bars_ingest_new_symbols(args: argparse.Namespace) -> None:
+    """Ingest bars only for active symbols that have no daily bars at all."""
+    log = logging.getLogger(__name__)
+
+    if not args.daily:
+        _run_ingest_new_symbols(args)
+        return
+
+    # --daily: sleep until 19:30 JST, run, repeat forever
+    while True:
+        wait = _seconds_until_next_jst_1930()
+        log.info("--daily: sleeping %.0f seconds until next 19:30 JST", wait)
+        time.sleep(wait)
+        log.info("19:30 JST reached, starting ingest-new-symbols")
+        try:
+            _run_ingest_new_symbols(args)
+        except SystemExit:
+            log.error("ingest-new-symbols failed, will retry at next 19:30 JST")
+        except Exception as exc:
+            log.error("ingest-new-symbols unexpected error: %s", exc, exc_info=True)
 
 
 def bars_run_summary(args: argparse.Namespace) -> None:
@@ -529,6 +563,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest_new_parser.add_argument(
         "--adjustment-type", choices=("unadjusted", "split_adjusted"), default="unadjusted",
+    )
+    ingest_new_parser.add_argument(
+        "--daily", action="store_true",
+        help="Run continuously, executing at 19:30 JST each day (does not run at startup).",
     )
     ingest_new_parser.set_defaults(func=bars_ingest_new_symbols)
 

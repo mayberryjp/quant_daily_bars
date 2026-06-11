@@ -1,8 +1,8 @@
 """Tests for CLI parser construction."""
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
-from quant_daily_bars._cli_impl import build_parser, _contiguous_ranges
+from quant_daily_bars._cli_impl import build_parser, _contiguous_ranges, _seconds_until_next_jst_1930
 
 
 class TestCLIParser:
@@ -82,6 +82,7 @@ class TestCLIParser:
         assert args.from_date == date(2024, 1, 1)
         assert args.to_date is None
         assert args.adjustment_type == "unadjusted"
+        assert args.daily is False
 
     def test_ingest_new_symbols_with_to_date(self):
         parser = build_parser()
@@ -94,6 +95,27 @@ class TestCLIParser:
         assert args.from_date == date(2024, 1, 1)
         assert args.to_date == date(2024, 6, 30)
         assert args.adjustment_type == "split_adjusted"
+
+    def test_ingest_new_symbols_daily_flag(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "bars", "ingest-new-symbols",
+            "--from-date", "2024-01-01",
+            "--daily",
+        ])
+        assert args.daily is True
+
+
+class TestSecondsUntilJST1930:
+    def test_before_target_returns_same_day(self):
+        jst = timezone(timedelta(hours=9))
+        # If it's 10:00 JST, should be ~9.5 hours
+        result = _seconds_until_next_jst_1930()
+        assert result > 0
+
+    def test_result_is_positive(self):
+        result = _seconds_until_next_jst_1930()
+        assert 0 < result <= 86400
 
 
 class TestContiguousRanges:
