@@ -132,6 +132,7 @@ class DailyBarIngestJob:
                 summary.errors += 1
                 summary.failures.append(f"{target.ticker}: {exc}")
                 log.error("unexpected error ingesting %s: %s", target.ticker, exc, exc_info=True)
+            self._heartbeat(run_id)
 
         summary.status = "failed" if summary.errors > 0 and summary.symbols_succeeded == 0 else "ok"
         summary.duration_seconds = time.monotonic() - started
@@ -177,10 +178,10 @@ class DailyBarIngestJob:
                 text("""
                     INSERT INTO market_data.vendor_bar_runs (
                         vendor_source_id, mode, requested_start_date, requested_end_date,
-                        symbols_requested
+                        symbols_requested, heartbeat_at
                     ) VALUES (
                         (SELECT id FROM market_data.vendor_bar_sources WHERE vendor_name = 'polygon'),
-                        :mode, :start_date, :end_date, :symbols_count
+                        :mode, :start_date, :end_date, :symbols_count, now()
                     ) RETURNING id
                 """),
                 {
@@ -191,6 +192,15 @@ class DailyBarIngestJob:
                 },
             ).scalar_one()
             return row
+
+    def _heartbeat(self, run_id: int) -> None:
+        """Refresh the run's heartbeat so the stale-run sweep knows it is alive."""
+        assert self._engine is not None
+        with self._engine.begin() as conn:
+            conn.execute(
+                text("UPDATE market_data.vendor_bar_runs SET heartbeat_at = now() WHERE id = :run_id"),
+                {"run_id": run_id},
+            )
 
     def _ingest_symbol(self, target: IngestTarget, options: IngestOptions, run_id: int) -> int:
         """Fetch and upsert daily bars for one symbol. Returns count of bars upserted."""

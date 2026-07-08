@@ -10,8 +10,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates git vim procps \
     && rm -rf /var/lib/apt/lists/*
 
-ARG CACHE_BUST=1
-RUN git clone https://github.com/mayberryjp/quant_daily_bars.git .
+COPY . .
 
 RUN python3 -m pip install --upgrade pip \
     && python3 -m pip install -e ".[dev]" \

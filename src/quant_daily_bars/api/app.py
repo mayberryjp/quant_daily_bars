@@ -61,7 +61,7 @@ IngestSubmit = Callable[[IngestTriggerParams], Dict[str, Any]]
 IngestJobDetail = Callable[[str], Optional[Dict[str, Any]]]
 IngestJobList = Callable[..., Dict[str, Any]]
 
-VALID_RUN_STATUSES = frozenset(("running", "completed", "failed"))
+VALID_RUN_STATUSES = frozenset(("running", "completed", "failed", "cancelled"))
 VALID_ADJUSTMENT_TYPES = frozenset(("unadjusted", "split_adjusted"))
 
 

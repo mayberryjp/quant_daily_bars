@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
-EXPECTED_SCHEMA_VERSION = "0002_symbol_backfill_status"
+EXPECTED_SCHEMA_VERSION = "0003_vendor_bar_runs_heartbeat"
 EXPECTED_TABLES = (
     "corporate_actions",
     "daily_bars",
@@ -109,6 +109,23 @@ def _parse_date(value: str) -> date:
         raise argparse.ArgumentTypeError(f"invalid date: {value} (use YYYY-MM-DD)") from exc
 
 
+def _sweep_stale_runs(engine: object) -> None:
+    """Best-effort cleanup of orphaned 'running' ingest runs. Never raises."""
+    from quant_daily_bars.ingest.maintenance import cancel_stale_runs
+
+    log = logging.getLogger(__name__)
+    try:
+        stale_minutes = int(os.environ.get("INGEST_STALE_AFTER_MINUTES", "30"))
+    except ValueError:
+        stale_minutes = 30
+    try:
+        cancelled = cancel_stale_runs(engine, stale_after_minutes=stale_minutes)  # type: ignore[arg-type]
+        if cancelled:
+            log.warning("cancelled %d stale ingest run(s): %s", len(cancelled), cancelled)
+    except Exception as exc:  # noqa: BLE001 - cleanup must never abort ingestion
+        log.warning("stale-run sweep failed: %s", exc)
+
+
 def bars_ingest(args: argparse.Namespace) -> None:
     from quant_daily_bars.ingest.job import DailyBarIngestJob, IngestOptions
     from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
@@ -149,6 +166,8 @@ def bars_ingest(args: argparse.Namespace) -> None:
         )
 
         engine = None if args.dry_run and not args.fixture else _engine()
+        if engine is not None and not args.fixture:
+            _sweep_stale_runs(engine)
         client = None
         if not args.fixture:
             try:
@@ -497,6 +516,20 @@ def bars_run_summary(args: argparse.Namespace) -> None:
     )
 
 
+def bars_cancel_stale_runs(args: argparse.Namespace) -> None:
+    """Mark orphaned 'running' ingest runs (no recent heartbeat) as 'cancelled'."""
+    from quant_daily_bars.ingest.maintenance import cancel_stale_runs
+
+    engine = _engine()
+    cancelled = cancel_stale_runs(engine, stale_after_minutes=args.stale_after_minutes)
+    print(
+        "cancel_stale_runs "
+        f"cancelled={len(cancelled)} "
+        f"ids={cancelled} "
+        f"stale_after_minutes={args.stale_after_minutes}"
+    )
+
+
 # ── parser ──────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -537,6 +570,16 @@ def build_parser() -> argparse.ArgumentParser:
     run_summary_parser = bars_subparsers.add_parser("run-summary")
     run_summary_parser.add_argument("--latest", action="store_true", required=True)
     run_summary_parser.set_defaults(func=bars_run_summary)
+
+    cancel_stale_parser = bars_subparsers.add_parser(
+        "cancel-stale-runs",
+        help="Mark orphaned 'running' ingest runs (no recent heartbeat) as 'cancelled'.",
+    )
+    cancel_stale_parser.add_argument(
+        "--stale-after-minutes", type=int, default=30,
+        help="Cancel running runs whose last heartbeat is older than this (default: 30).",
+    )
+    cancel_stale_parser.set_defaults(func=bars_cancel_stale_runs)
 
     backfill_gaps_parser = bars_subparsers.add_parser("backfill-gaps")
     backfill_gaps_parser.add_argument(

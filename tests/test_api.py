@@ -7,7 +7,7 @@ from quant_daily_bars.api.testing import TestClient
 
 
 def _ok_readiness():
-    return ReadinessStatus(database="ok", schema_version="0002_symbol_backfill_status", tables=6)
+    return ReadinessStatus(database="ok", schema_version="0003_vendor_bar_runs_heartbeat", tables=6)
 
 
 def _fake_bar_list(params: BarListParams):

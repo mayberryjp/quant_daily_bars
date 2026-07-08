@@ -48,6 +48,17 @@ class TestCLIParser:
         assert args.bars_command == "run-summary"
         assert args.latest is True
 
+    def test_cancel_stale_runs_defaults(self):
+        parser = build_parser()
+        args = parser.parse_args(["bars", "cancel-stale-runs"])
+        assert args.bars_command == "cancel-stale-runs"
+        assert args.stale_after_minutes == 30
+
+    def test_cancel_stale_runs_custom_threshold(self):
+        parser = build_parser()
+        args = parser.parse_args(["bars", "cancel-stale-runs", "--stale-after-minutes", "120"])
+        assert args.stale_after_minutes == 120
+
     def test_scheduled_mode_no_from_date(self):
         parser = build_parser()
         args = parser.parse_args(["bars", "ingest", "--schedule", "86400"])
