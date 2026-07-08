@@ -514,6 +514,249 @@ def get_coverage_gaps(
     }
 
 
+def get_gap_symbols(
+    reference_ticker: str = "MSFT",
+    from_date: str | None = None,
+    to_date: str | None = None,
+    adjustment_type: str = "unadjusted",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any] | None:
+    """Rank symbols by number of missing bars within their listed lifespan.
+
+    A gap is a reference-calendar trading day that falls on/after a symbol's first
+    bar date and on/before its last bar date, but for which the symbol has no bar.
+    Pre-listing and post-delisting dates are never counted as gaps. Returns ``None``
+    when the reference symbol has no bars in the requested window.
+    """
+    from sqlalchemy import text
+
+    engine = _engine()
+    try:
+        with engine.connect() as conn:
+            values: dict[str, Any] = {
+                "reference_ticker": reference_ticker,
+                "adjustment_type": adjustment_type,
+                "limit": limit,
+                "offset": offset,
+            }
+            date_filters = []
+            if from_date is not None:
+                date_filters.append("d.bar_date >= :from_date")
+                values["from_date"] = from_date
+            if to_date is not None:
+                date_filters.append("d.bar_date <= :to_date")
+                values["to_date"] = to_date
+            date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
+
+            trading_days = conn.execute(
+                text(f"""
+                    SELECT COUNT(DISTINCT d.bar_date)
+                    FROM market_data.daily_bars d
+                    WHERE d.ticker = :reference_ticker
+                      AND d.adjustment_type = :adjustment_type
+                      {date_clause}
+                """),
+                values,
+            ).scalar_one()
+
+            if trading_days == 0:
+                return None
+
+            rows = conn.execute(
+                text(f"""
+                    WITH calendar AS (
+                        SELECT DISTINCT d.bar_date
+                        FROM market_data.daily_bars d
+                        WHERE d.ticker = :reference_ticker
+                          AND d.adjustment_type = :adjustment_type
+                          {date_clause}
+                    ),
+                    sym AS (
+                        SELECT d.symbol_id, d.ticker,
+                               MIN(d.bar_date) AS first_date,
+                               MAX(d.bar_date) AS last_date
+                        FROM market_data.daily_bars d
+                        WHERE d.adjustment_type = :adjustment_type
+                        GROUP BY d.symbol_id, d.ticker
+                    ),
+                    expected AS (
+                        SELECT s.symbol_id, s.ticker, s.first_date, s.last_date,
+                               COUNT(c.bar_date) AS expected_days
+                        FROM sym s
+                        JOIN calendar c
+                            ON c.bar_date >= s.first_date AND c.bar_date <= s.last_date
+                        GROUP BY s.symbol_id, s.ticker, s.first_date, s.last_date
+                    ),
+                    present AS (
+                        SELECT d.symbol_id, COUNT(DISTINCT d.bar_date) AS present_days
+                        FROM market_data.daily_bars d
+                        JOIN calendar c ON c.bar_date = d.bar_date
+                        WHERE d.adjustment_type = :adjustment_type
+                        GROUP BY d.symbol_id
+                    )
+                    SELECT e.symbol_id, e.ticker, e.first_date, e.last_date,
+                           e.expected_days,
+                           COALESCE(p.present_days, 0) AS present_days,
+                           e.expected_days - COALESCE(p.present_days, 0) AS gap_days
+                    FROM expected e
+                    LEFT JOIN present p ON p.symbol_id = e.symbol_id
+                    WHERE e.expected_days - COALESCE(p.present_days, 0) > 0
+                    ORDER BY gap_days DESC, e.ticker ASC
+                    LIMIT :limit OFFSET :offset
+                """),
+                values,
+            ).mappings().all()
+    finally:
+        engine.dispose()
+
+    items = []
+    for row in rows:
+        expected_days = int(row["expected_days"])
+        gap_days = int(row["gap_days"])
+        items.append(
+            {
+                "symbol_id": int(row["symbol_id"]),
+                "ticker": row["ticker"],
+                "first_date": str(row["first_date"]),
+                "last_date": str(row["last_date"]),
+                "expected_days": expected_days,
+                "present_days": int(row["present_days"]),
+                "gap_days": gap_days,
+                "gap_pct": round(gap_days / expected_days * 100, 2) if expected_days > 0 else 0.0,
+            }
+        )
+
+    return {
+        "reference_ticker": reference_ticker,
+        "adjustment_type": adjustment_type,
+        "trading_days": int(trading_days),
+        "limit": limit,
+        "offset": offset,
+        "count": len(items),
+        "items": items,
+    }
+
+
+def get_gap_dates(
+    reference_ticker: str = "MSFT",
+    from_date: str | None = None,
+    to_date: str | None = None,
+    adjustment_type: str = "unadjusted",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any] | None:
+    """Rank reference-calendar dates by number of symbols missing a bar.
+
+    For each trading day (a day the reference symbol has a bar), a symbol counts as
+    missing when the day falls within that symbol's [first_bar, last_bar] span but the
+    symbol has no bar. Symbols not yet listed (or already delisted) on a day are not
+    counted. Returns ``None`` when the reference symbol has no bars in range.
+    """
+    from sqlalchemy import text
+
+    engine = _engine()
+    try:
+        with engine.connect() as conn:
+            values: dict[str, Any] = {
+                "reference_ticker": reference_ticker,
+                "adjustment_type": adjustment_type,
+                "limit": limit,
+                "offset": offset,
+            }
+            date_filters = []
+            if from_date is not None:
+                date_filters.append("d.bar_date >= :from_date")
+                values["from_date"] = from_date
+            if to_date is not None:
+                date_filters.append("d.bar_date <= :to_date")
+                values["to_date"] = to_date
+            date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
+
+            trading_days = conn.execute(
+                text(f"""
+                    SELECT COUNT(DISTINCT d.bar_date)
+                    FROM market_data.daily_bars d
+                    WHERE d.ticker = :reference_ticker
+                      AND d.adjustment_type = :adjustment_type
+                      {date_clause}
+                """),
+                values,
+            ).scalar_one()
+
+            if trading_days == 0:
+                return None
+
+            rows = conn.execute(
+                text(f"""
+                    WITH calendar AS (
+                        SELECT DISTINCT d.bar_date
+                        FROM market_data.daily_bars d
+                        WHERE d.ticker = :reference_ticker
+                          AND d.adjustment_type = :adjustment_type
+                          {date_clause}
+                    ),
+                    sym AS (
+                        SELECT d.symbol_id,
+                               MIN(d.bar_date) AS first_date,
+                               MAX(d.bar_date) AS last_date
+                        FROM market_data.daily_bars d
+                        WHERE d.adjustment_type = :adjustment_type
+                        GROUP BY d.symbol_id
+                    ),
+                    expected AS (
+                        SELECT c.bar_date, COUNT(*) AS symbols_expected
+                        FROM calendar c
+                        JOIN sym s
+                            ON c.bar_date >= s.first_date AND c.bar_date <= s.last_date
+                        GROUP BY c.bar_date
+                    ),
+                    present AS (
+                        SELECT d.bar_date, COUNT(DISTINCT d.symbol_id) AS symbols_present
+                        FROM market_data.daily_bars d
+                        JOIN calendar c ON c.bar_date = d.bar_date
+                        WHERE d.adjustment_type = :adjustment_type
+                        GROUP BY d.bar_date
+                    )
+                    SELECT e.bar_date, e.symbols_expected,
+                           COALESCE(p.symbols_present, 0) AS symbols_present,
+                           e.symbols_expected - COALESCE(p.symbols_present, 0) AS symbols_missing
+                    FROM expected e
+                    LEFT JOIN present p ON p.bar_date = e.bar_date
+                    WHERE e.symbols_expected - COALESCE(p.symbols_present, 0) > 0
+                    ORDER BY symbols_missing DESC, e.bar_date DESC
+                    LIMIT :limit OFFSET :offset
+                """),
+                values,
+            ).mappings().all()
+    finally:
+        engine.dispose()
+
+    items = []
+    for row in rows:
+        expected = int(row["symbols_expected"])
+        missing = int(row["symbols_missing"])
+        items.append(
+            {
+                "bar_date": str(row["bar_date"]),
+                "symbols_expected": expected,
+                "symbols_present": int(row["symbols_present"]),
+                "symbols_missing": missing,
+                "gap_pct": round(missing / expected * 100, 2) if expected > 0 else 0.0,
+            }
+        )
+
+    return {
+        "reference_ticker": reference_ticker,
+        "adjustment_type": adjustment_type,
+        "trading_days": int(trading_days),
+        "limit": limit,
+        "offset": offset,
+        "count": len(items),
+        "items": items,
+    }
+
+
 def _bar_to_item(row: Any) -> dict[str, Any]:
     return {
         "id": int(row["id"]),

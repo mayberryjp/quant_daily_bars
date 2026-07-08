@@ -156,6 +156,46 @@ def _fake_coverage_gaps(reference_ticker="MSFT", from_date=None, to_date=None,
     }
 
 
+def _fake_gap_symbols(reference_ticker="MSFT", from_date=None, to_date=None,
+                      adjustment_type="unadjusted", limit=50, offset=0):
+    if reference_ticker == "ZZZZ":
+        return None
+    return {
+        "reference_ticker": reference_ticker,
+        "adjustment_type": adjustment_type,
+        "trading_days": 2517,
+        "limit": limit,
+        "offset": offset,
+        "count": 2,
+        "items": [
+            {"symbol_id": 7, "ticker": "FOO", "first_date": "2018-05-01", "last_date": "2025-07-07",
+             "expected_days": 1800, "present_days": 1700, "gap_days": 100, "gap_pct": 5.56},
+            {"symbol_id": 9, "ticker": "BAR", "first_date": "2020-01-02", "last_date": "2025-07-07",
+             "expected_days": 1380, "present_days": 1360, "gap_days": 20, "gap_pct": 1.45},
+        ],
+    }
+
+
+def _fake_gap_dates(reference_ticker="MSFT", from_date=None, to_date=None,
+                    adjustment_type="unadjusted", limit=50, offset=0):
+    if reference_ticker == "ZZZZ":
+        return None
+    return {
+        "reference_ticker": reference_ticker,
+        "adjustment_type": adjustment_type,
+        "trading_days": 2517,
+        "limit": limit,
+        "offset": offset,
+        "count": 2,
+        "items": [
+            {"bar_date": "2021-03-15", "symbols_expected": 480, "symbols_present": 410,
+             "symbols_missing": 70, "gap_pct": 14.58},
+            {"bar_date": "2019-08-02", "symbols_expected": 450, "symbols_present": 420,
+             "symbols_missing": 30, "gap_pct": 6.67},
+        ],
+    }
+
+
 def _fake_ingest_latest():
     return {
         "run_id": 1,
@@ -189,6 +229,8 @@ def _make_client():
         missing_bars_fn=_fake_missing_bars,
         backfill_progress_fn=_fake_backfill_progress,
         coverage_gaps_fn=_fake_coverage_gaps,
+        gap_symbols_fn=_fake_gap_symbols,
+        gap_dates_fn=_fake_gap_dates,
     )
     return TestClient(app)
 
@@ -392,3 +434,46 @@ class TestCoverageGaps:
         client = _make_client()
         resp = client.get("/bars/coverage-gaps", params={"limit": "99999"})
         assert resp.status_code == 422
+
+
+class TestGapRankings:
+    def test_gap_symbols_default(self):
+        client = _make_client()
+        resp = client.get("/bars/gaps/symbols")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["reference_ticker"] == "MSFT"
+        assert data["count"] == 2
+        assert data["items"][0]["ticker"] == "FOO"
+        assert data["items"][0]["gap_days"] == 100
+
+    def test_gap_symbols_custom_ticker(self):
+        client = _make_client()
+        resp = client.get("/bars/gaps/symbols", params={"ticker": "AAPL"})
+        assert resp.status_code == 200
+        assert resp.json()["reference_ticker"] == "AAPL"
+
+    def test_gap_symbols_not_found(self):
+        client = _make_client()
+        resp = client.get("/bars/gaps/symbols", params={"ticker": "ZZZZ"})
+        assert resp.status_code == 404
+
+    def test_gap_symbols_invalid_limit(self):
+        client = _make_client()
+        resp = client.get("/bars/gaps/symbols", params={"limit": "0"})
+        assert resp.status_code == 422
+
+    def test_gap_dates_default(self):
+        client = _make_client()
+        resp = client.get("/bars/gaps/dates")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["reference_ticker"] == "MSFT"
+        assert data["count"] == 2
+        assert data["items"][0]["bar_date"] == "2021-03-15"
+        assert data["items"][0]["symbols_missing"] == 70
+
+    def test_gap_dates_not_found(self):
+        client = _make_client()
+        resp = client.get("/bars/gaps/dates", params={"ticker": "ZZZZ"})
+        assert resp.status_code == 404

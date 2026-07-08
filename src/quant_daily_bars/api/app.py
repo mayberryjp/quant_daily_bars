@@ -22,6 +22,8 @@ from quant_daily_bars.api.bars import (
     get_bar_date_range,
     get_bar_summary,
     get_coverage_gaps,
+    get_gap_dates,
+    get_gap_symbols,
     get_ingest_run,
     get_latest_ingest_run,
     get_missing_bars,
@@ -46,6 +48,8 @@ IngestLatest = Callable[[], Optional[Dict[str, Any]]]
 MissingBars = Callable[..., Dict[str, Any]]
 BackfillProgress = Callable[..., Dict[str, Any]]
 CoverageGaps = Callable[..., Optional[Dict[str, Any]]]
+GapSymbols = Callable[..., Optional[Dict[str, Any]]]
+GapDates = Callable[..., Optional[Dict[str, Any]]]
 
 VALID_RUN_STATUSES = frozenset(("running", "completed", "failed"))
 VALID_ADJUSTMENT_TYPES = frozenset(("unadjusted", "split_adjusted"))
@@ -134,6 +138,8 @@ def create_app(
     missing_bars_fn: MissingBars = get_missing_bars,
     backfill_progress_fn: BackfillProgress = get_backfill_progress,
     coverage_gaps_fn: CoverageGaps = get_coverage_gaps,
+    gap_symbols_fn: GapSymbols = get_gap_symbols,
+    gap_dates_fn: GapDates = get_gap_dates,
 ) -> Bottle:
     api = Bottle()
     api.title = SERVICE_NAME
@@ -257,6 +263,56 @@ def create_app(
         reference_ticker = request.query.get("ticker") or "MSFT"
         try:
             result = coverage_gaps_fn(
+                reference_ticker=reference_ticker,
+                from_date=request.query.get("from_date") or None,
+                to_date=request.query.get("to_date") or None,
+                adjustment_type=adjustment_type or "unadjusted",
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as exc:
+            return _server_error(exc)
+        if result is None:
+            return _not_found(f"no bars for reference ticker {reference_ticker}")
+        return result
+
+    @api.get("/bars/gaps/symbols")
+    def bars_gap_symbols_route() -> dict:
+        try:
+            limit = _int_param(request.query.get("limit"), default=50, ge=1, le=1000)
+            offset = _int_param(request.query.get("offset"), default=0, ge=0)
+            adjustment_type = _adjustment_param(request.query.get("adjustment_type"))
+        except _ValidationError as exc:
+            return _validation_error_response(str(exc))
+
+        reference_ticker = request.query.get("ticker") or "MSFT"
+        try:
+            result = gap_symbols_fn(
+                reference_ticker=reference_ticker,
+                from_date=request.query.get("from_date") or None,
+                to_date=request.query.get("to_date") or None,
+                adjustment_type=adjustment_type or "unadjusted",
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as exc:
+            return _server_error(exc)
+        if result is None:
+            return _not_found(f"no bars for reference ticker {reference_ticker}")
+        return result
+
+    @api.get("/bars/gaps/dates")
+    def bars_gap_dates_route() -> dict:
+        try:
+            limit = _int_param(request.query.get("limit"), default=50, ge=1, le=1000)
+            offset = _int_param(request.query.get("offset"), default=0, ge=0)
+            adjustment_type = _adjustment_param(request.query.get("adjustment_type"))
+        except _ValidationError as exc:
+            return _validation_error_response(str(exc))
+
+        reference_ticker = request.query.get("ticker") or "MSFT"
+        try:
+            result = gap_dates_fn(
                 reference_ticker=reference_ticker,
                 from_date=request.query.get("from_date") or None,
                 to_date=request.query.get("to_date") or None,
