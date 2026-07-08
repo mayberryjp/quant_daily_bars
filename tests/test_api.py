@@ -216,6 +216,53 @@ def _fake_ingest_latest():
     }
 
 
+def _fake_ingest_submit(params):
+    return {
+        "job_id": "job-123",
+        "state": "queued",
+        "from_date": params.from_date.isoformat(),
+        "to_date": params.to_date.isoformat(),
+        "tickers": params.tickers,
+        "adjustment_type": params.adjustment_type,
+        "mode": params.mode,
+        "submitted_at": "2026-07-08T00:00:00+00:00",
+        "started_at": None,
+        "finished_at": None,
+        "run_id": None,
+        "summary": None,
+        "error": None,
+    }
+
+
+def _fake_ingest_job_detail(job_id):
+    if job_id == "job-123":
+        return {
+            "job_id": "job-123",
+            "state": "completed",
+            "from_date": "2024-01-03",
+            "to_date": "2024-01-05",
+            "tickers": ["MSFT"],
+            "adjustment_type": "unadjusted",
+            "mode": "backfill",
+            "submitted_at": "2026-07-08T00:00:00+00:00",
+            "started_at": "2026-07-08T00:00:01+00:00",
+            "finished_at": "2026-07-08T00:00:09+00:00",
+            "run_id": 5,
+            "summary": {"status": "ok", "bars_upserted": 15},
+            "error": None,
+        }
+    return None
+
+
+def _fake_ingest_jobs_list(limit=50):
+    return {
+        "items": [
+            {"job_id": "job-123", "state": "completed", "run_id": 5},
+        ],
+        "count": 1,
+    }
+
+
 def _make_client():
     app = create_app(
         readiness_check=_ok_readiness,
@@ -231,6 +278,9 @@ def _make_client():
         coverage_gaps_fn=_fake_coverage_gaps,
         gap_symbols_fn=_fake_gap_symbols,
         gap_dates_fn=_fake_gap_dates,
+        ingest_submit_fn=_fake_ingest_submit,
+        ingest_job_detail_fn=_fake_ingest_job_detail,
+        ingest_jobs_list_fn=_fake_ingest_jobs_list,
     )
     return TestClient(app)
 
@@ -477,3 +527,72 @@ class TestGapRankings:
         client = _make_client()
         resp = client.get("/bars/gaps/dates", params={"ticker": "ZZZZ"})
         assert resp.status_code == 404
+
+
+class TestIngestTrigger:
+    def test_trigger_accepted(self):
+        client = _make_client()
+        resp = client.post("/ingest", json={
+            "from_date": "2024-01-03",
+            "to_date": "2024-01-05",
+            "tickers": ["MSFT", "AAPL"],
+        })
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["status"] == "accepted"
+        assert data["job"]["job_id"] == "job-123"
+        assert data["job"]["state"] == "queued"
+        assert data["job"]["from_date"] == "2024-01-03"
+        assert data["job"]["to_date"] == "2024-01-05"
+        assert data["job"]["tickers"] == ["MSFT", "AAPL"]
+
+    def test_trigger_single_date_defaults_to_date(self):
+        client = _make_client()
+        resp = client.post("/ingest", json={"from_date": "2024-01-03"})
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["job"]["from_date"] == "2024-01-03"
+        assert data["job"]["to_date"] == "2024-01-03"
+
+    def test_trigger_missing_from_date(self):
+        client = _make_client()
+        resp = client.post("/ingest", json={"to_date": "2024-01-05"})
+        assert resp.status_code == 422
+
+    def test_trigger_bad_date_range(self):
+        client = _make_client()
+        resp = client.post("/ingest", json={"from_date": "2024-01-05", "to_date": "2024-01-01"})
+        assert resp.status_code == 422
+
+    def test_trigger_invalid_adjustment(self):
+        client = _make_client()
+        resp = client.post("/ingest", json={"from_date": "2024-01-03", "adjustment_type": "bogus"})
+        assert resp.status_code == 422
+
+    def test_trigger_empty_body(self):
+        client = _make_client()
+        resp = client.post("/ingest")
+        assert resp.status_code == 422
+
+    def test_job_detail(self):
+        client = _make_client()
+        resp = client.get("/ingest/jobs/job-123")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["job_id"] == "job-123"
+        assert data["state"] == "completed"
+        assert data["run_id"] == 5
+
+    def test_job_detail_not_found(self):
+        client = _make_client()
+        resp = client.get("/ingest/jobs/does-not-exist")
+        assert resp.status_code == 404
+
+    def test_jobs_list(self):
+        client = _make_client()
+        resp = client.get("/ingest/jobs")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["items"][0]["job_id"] == "job-123"
+

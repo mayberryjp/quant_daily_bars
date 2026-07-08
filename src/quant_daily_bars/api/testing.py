@@ -30,6 +30,13 @@ class WSGIClient:
         resp = self._app.get(url, params=params, expect_errors=True)
         return _Response(resp)
 
+    def post(self, url: str, *, json=None, params=None):
+        if json is not None:
+            resp = self._app.post_json(url, params=json, expect_errors=True)
+        else:
+            resp = self._app.post(url, params=params or {}, expect_errors=True)
+        return _Response(resp)
+
 
 # Alias used by all test files.
 TestClient = WSGIClient

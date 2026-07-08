@@ -31,6 +31,13 @@ from quant_daily_bars.api.bars import (
     list_ingest_runs,
     list_tickers_coverage,
 )
+from quant_daily_bars.api.ingest_jobs import (
+    IngestTriggerError,
+    IngestTriggerParams,
+    get_ingest_job,
+    list_ingest_jobs,
+    submit_ingest_job,
+)
 
 SERVICE_NAME = "quant-daily-bars-api"
 
@@ -50,6 +57,9 @@ BackfillProgress = Callable[..., Dict[str, Any]]
 CoverageGaps = Callable[..., Optional[Dict[str, Any]]]
 GapSymbols = Callable[..., Optional[Dict[str, Any]]]
 GapDates = Callable[..., Optional[Dict[str, Any]]]
+IngestSubmit = Callable[[IngestTriggerParams], Dict[str, Any]]
+IngestJobDetail = Callable[[str], Optional[Dict[str, Any]]]
+IngestJobList = Callable[..., Dict[str, Any]]
 
 VALID_RUN_STATUSES = frozenset(("running", "completed", "failed"))
 VALID_ADJUSTMENT_TYPES = frozenset(("unadjusted", "split_adjusted"))
@@ -140,6 +150,9 @@ def create_app(
     coverage_gaps_fn: CoverageGaps = get_coverage_gaps,
     gap_symbols_fn: GapSymbols = get_gap_symbols,
     gap_dates_fn: GapDates = get_gap_dates,
+    ingest_submit_fn: IngestSubmit = submit_ingest_job,
+    ingest_job_detail_fn: IngestJobDetail = get_ingest_job,
+    ingest_jobs_list_fn: IngestJobList = list_ingest_jobs,
 ) -> Bottle:
     api = Bottle()
     api.title = SERVICE_NAME
@@ -371,6 +384,48 @@ def create_app(
         if result is None:
             return _not_found("no ingest runs found")
         return {"status": "ok", "latest": result}
+
+    # -- ingest trigger (async) -----------------------------------------
+
+    @api.post("/ingest")
+    def ingest_trigger_route() -> dict:
+        try:
+            body = request.json
+        except Exception:
+            return _validation_error_response("invalid JSON body")
+        if body is None:
+            return _validation_error_response("a JSON body is required")
+        try:
+            params = IngestTriggerParams.from_body(body)
+        except IngestTriggerError as exc:
+            return _validation_error_response(str(exc))
+        try:
+            job = ingest_submit_fn(params)
+        except Exception as exc:
+            return _server_error(exc)
+        response.status = 202
+        return {"status": "accepted", "job": job}
+
+    @api.get("/ingest/jobs")
+    def ingest_jobs_list_route() -> dict:
+        try:
+            limit = _int_param(request.query.get("limit"), default=50, ge=1, le=200)
+        except _ValidationError as exc:
+            return _validation_error_response(str(exc))
+        try:
+            return ingest_jobs_list_fn(limit=limit)
+        except Exception as exc:
+            return _server_error(exc)
+
+    @api.get("/ingest/jobs/<job_id>")
+    def ingest_job_detail_route(job_id: str) -> dict:
+        try:
+            result = ingest_job_detail_fn(job_id)
+        except Exception as exc:
+            return _server_error(exc)
+        if result is None:
+            return _not_found("ingest job not found")
+        return result
 
     # -- missing bars ----------------------------------------------------
 

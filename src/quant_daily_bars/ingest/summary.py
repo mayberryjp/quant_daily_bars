@@ -19,6 +19,7 @@ class IngestSummary:
     errors: int = 0
     error_message: str | None = None
     duration_seconds: float | None = None
+    run_id: int | None = None
     warnings: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
 

@@ -111,6 +111,7 @@ class DailyBarIngestJob:
             return summary
 
         run_id = self._create_run(options, len(targets))
+        summary.run_id = run_id
 
         for target in targets:
             try:
