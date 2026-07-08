@@ -402,6 +402,118 @@ def get_backfill_progress(from_date: str = "2025-06-01") -> dict[str, Any]:
     }
 
 
+def get_coverage_gaps(
+    reference_ticker: str = "MSFT",
+    from_date: str | None = None,
+    to_date: str | None = None,
+    adjustment_type: str = "unadjusted",
+    limit: int = 1000,
+    offset: int = 0,
+) -> dict[str, Any] | None:
+    """Per-day cross-symbol coverage using a reference symbol as the trading calendar.
+
+    For every date on which ``reference_ticker`` has a bar, report how many active
+    symbols have a bar that day and how many are missing one. Returns ``None`` when
+    the reference symbol has no bars in the requested window.
+    """
+    from sqlalchemy import text
+
+    engine = _engine()
+    try:
+        with engine.connect() as conn:
+            values: dict[str, Any] = {
+                "reference_ticker": reference_ticker,
+                "adjustment_type": adjustment_type,
+                "limit": limit,
+                "offset": offset,
+            }
+            date_filters = []
+            if from_date is not None:
+                date_filters.append("d.bar_date >= :from_date")
+                values["from_date"] = from_date
+            if to_date is not None:
+                date_filters.append("d.bar_date <= :to_date")
+                values["to_date"] = to_date
+            date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
+
+            active_symbols = conn.execute(
+                text("SELECT COUNT(*) FROM symbol_master.symbols WHERE active = true")
+            ).scalar_one()
+
+            total_days = conn.execute(
+                text(f"""
+                    SELECT COUNT(DISTINCT d.bar_date)
+                    FROM market_data.daily_bars d
+                    WHERE d.ticker = :reference_ticker
+                      AND d.adjustment_type = :adjustment_type
+                      {date_clause}
+                """),
+                values,
+            ).scalar_one()
+
+            if total_days == 0:
+                return None
+
+            rows = conn.execute(
+                text(f"""
+                    WITH calendar AS (
+                        SELECT DISTINCT d.bar_date
+                        FROM market_data.daily_bars d
+                        WHERE d.ticker = :reference_ticker
+                          AND d.adjustment_type = :adjustment_type
+                          {date_clause}
+                    ),
+                    per_day AS (
+                        SELECT d.bar_date, COUNT(DISTINCT d.symbol_id) AS symbols_with_bar
+                        FROM market_data.daily_bars d
+                        JOIN calendar c ON c.bar_date = d.bar_date
+                        JOIN symbol_master.symbols s
+                            ON s.id = d.symbol_id AND s.active = true
+                        WHERE d.adjustment_type = :adjustment_type
+                        GROUP BY d.bar_date
+                    )
+                    SELECT c.bar_date,
+                           COALESCE(p.symbols_with_bar, 0) AS symbols_with_bar
+                    FROM calendar c
+                    LEFT JOIN per_day p ON p.bar_date = c.bar_date
+                    ORDER BY c.bar_date ASC
+                    LIMIT :limit OFFSET :offset
+                """),
+                values,
+            ).mappings().all()
+    finally:
+        engine.dispose()
+
+    active_total = int(active_symbols)
+    items = []
+    days_with_gaps = 0
+    for row in rows:
+        with_bar = int(row["symbols_with_bar"])
+        missing = active_total - with_bar
+        if missing > 0:
+            days_with_gaps += 1
+        items.append(
+            {
+                "bar_date": str(row["bar_date"]),
+                "symbols_with_bar": with_bar,
+                "symbols_missing": missing,
+                "coverage_pct": round(with_bar / active_total * 100, 2) if active_total > 0 else 0.0,
+            }
+        )
+
+    return {
+        "reference_ticker": reference_ticker,
+        "adjustment_type": adjustment_type,
+        "active_symbols": active_total,
+        "total_days": int(total_days),
+        "days_with_gaps": days_with_gaps,
+        "limit": limit,
+        "offset": offset,
+        "count": len(items),
+        "items": items,
+    }
+
+
 def _bar_to_item(row: Any) -> dict[str, Any]:
     return {
         "id": int(row["id"]),

@@ -136,6 +136,26 @@ def _fake_backfill_progress(from_date="2025-06-01"):
     }
 
 
+def _fake_coverage_gaps(reference_ticker="MSFT", from_date=None, to_date=None,
+                        adjustment_type="unadjusted", limit=1000, offset=0):
+    if reference_ticker == "ZZZZ":
+        return None
+    return {
+        "reference_ticker": reference_ticker,
+        "adjustment_type": adjustment_type,
+        "active_symbols": 10,
+        "total_days": 2,
+        "days_with_gaps": 1,
+        "limit": limit,
+        "offset": offset,
+        "count": 2,
+        "items": [
+            {"bar_date": "2024-01-02", "symbols_with_bar": 10, "symbols_missing": 0, "coverage_pct": 100.0},
+            {"bar_date": "2024-01-03", "symbols_with_bar": 8, "symbols_missing": 2, "coverage_pct": 80.0},
+        ],
+    }
+
+
 def _fake_ingest_latest():
     return {
         "run_id": 1,
@@ -168,6 +188,7 @@ def _make_client():
         ingest_latest=_fake_ingest_latest,
         missing_bars_fn=_fake_missing_bars,
         backfill_progress_fn=_fake_backfill_progress,
+        coverage_gaps_fn=_fake_coverage_gaps,
     )
     return TestClient(app)
 
@@ -341,3 +362,33 @@ class TestBackfillProgress:
         assert resp.status_code == 200
         data = resp.json()
         assert data["from_date"] == "2024-01-01"
+
+
+class TestCoverageGaps:
+    def test_coverage_gaps_default(self):
+        client = _make_client()
+        resp = client.get("/bars/coverage-gaps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["reference_ticker"] == "MSFT"
+        assert data["active_symbols"] == 10
+        assert data["count"] == 2
+        assert data["items"][0]["symbols_missing"] == 0
+        assert data["items"][1]["symbols_missing"] == 2
+        assert data["items"][1]["coverage_pct"] == 80.0
+
+    def test_coverage_gaps_custom_ticker(self):
+        client = _make_client()
+        resp = client.get("/bars/coverage-gaps", params={"ticker": "AAPL"})
+        assert resp.status_code == 200
+        assert resp.json()["reference_ticker"] == "AAPL"
+
+    def test_coverage_gaps_not_found(self):
+        client = _make_client()
+        resp = client.get("/bars/coverage-gaps", params={"ticker": "ZZZZ"})
+        assert resp.status_code == 404
+
+    def test_coverage_gaps_invalid_limit(self):
+        client = _make_client()
+        resp = client.get("/bars/coverage-gaps", params={"limit": "99999"})
+        assert resp.status_code == 422

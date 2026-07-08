@@ -132,9 +132,9 @@ class DailyBarIngestJob:
                 summary.failures.append(f"{target.ticker}: {exc}")
                 log.error("unexpected error ingesting %s: %s", target.ticker, exc, exc_info=True)
 
-        self._finalize_run(run_id, summary)
         summary.status = "failed" if summary.errors > 0 and summary.symbols_succeeded == 0 else "ok"
         summary.duration_seconds = time.monotonic() - started
+        self._finalize_run(run_id, summary)
         return summary
 
     def _resolve_targets(self, options: IngestOptions) -> list[IngestTarget]:
@@ -360,6 +360,8 @@ class DailyBarIngestJob:
                         )
                         summary.bars_upserted += 1
                 summary.symbols_succeeded += 1
+                summary.status = "ok" if summary.errors == 0 else "failed"
+                summary.duration_seconds = time.monotonic() - started
                 self._finalize_run(run_id, summary)
             else:
                 summary.bars_upserted += len(bars)

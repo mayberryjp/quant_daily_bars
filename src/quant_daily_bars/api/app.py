@@ -21,6 +21,7 @@ from quant_daily_bars.api.bars import (
     get_backfill_progress,
     get_bar_date_range,
     get_bar_summary,
+    get_coverage_gaps,
     get_ingest_run,
     get_latest_ingest_run,
     get_missing_bars,
@@ -44,6 +45,7 @@ IngestRunDetail = Callable[[int], Optional[Dict[str, Any]]]
 IngestLatest = Callable[[], Optional[Dict[str, Any]]]
 MissingBars = Callable[..., Dict[str, Any]]
 BackfillProgress = Callable[..., Dict[str, Any]]
+CoverageGaps = Callable[..., Optional[Dict[str, Any]]]
 
 VALID_RUN_STATUSES = frozenset(("running", "completed", "failed"))
 VALID_ADJUSTMENT_TYPES = frozenset(("unadjusted", "split_adjusted"))
@@ -131,6 +133,7 @@ def create_app(
     ingest_latest: IngestLatest = get_latest_ingest_run,
     missing_bars_fn: MissingBars = get_missing_bars,
     backfill_progress_fn: BackfillProgress = get_backfill_progress,
+    coverage_gaps_fn: CoverageGaps = get_coverage_gaps,
 ) -> Bottle:
     api = Bottle()
     api.title = SERVICE_NAME
@@ -241,6 +244,31 @@ def create_app(
             return backfill_progress_fn(from_date=from_date)
         except Exception as exc:
             return _server_error(exc)
+
+    @api.get("/bars/coverage-gaps")
+    def bars_coverage_gaps_route() -> dict:
+        try:
+            limit = _int_param(request.query.get("limit"), default=1000, ge=1, le=5000)
+            offset = _int_param(request.query.get("offset"), default=0, ge=0)
+            adjustment_type = _adjustment_param(request.query.get("adjustment_type"))
+        except _ValidationError as exc:
+            return _validation_error_response(str(exc))
+
+        reference_ticker = request.query.get("ticker") or "MSFT"
+        try:
+            result = coverage_gaps_fn(
+                reference_ticker=reference_ticker,
+                from_date=request.query.get("from_date") or None,
+                to_date=request.query.get("to_date") or None,
+                adjustment_type=adjustment_type or "unadjusted",
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as exc:
+            return _server_error(exc)
+        if result is None:
+            return _not_found(f"no bars for reference ticker {reference_ticker}")
+        return result
 
     # -- ingest runs -----------------------------------------------------
 
