@@ -4,3 +4,12 @@ services:
     container_name: quant_daily_bars
     stdin_open: true
     tty: true
+    environment:
+      DATABASE_URL: postgresql+psycopg://quant:quant@postgres.quant.mayberry.farm:5432/quant
+      MASSIVE_API_KEY: ""
+      MASSIVE_BASE_URL: https://api.polygon.io
+      MASSIVE_TIMEOUT_SECONDS: "30"
+      MASSIVE_RETRY_COUNT: "3"
+      MASSIVE_BACKOFF_SECONDS: "0.5"
+      MASSIVE_BACKOFF_MULTIPLIER: "2"
+      MASSIVE_RATE_LIMIT_RPM: "5"
