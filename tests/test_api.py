@@ -4,6 +4,7 @@ from quant_daily_bars.api.app import create_app
 from quant_daily_bars.api.readiness import ReadinessStatus
 from quant_daily_bars.api.bars import BarListParams, IngestRunListParams
 from quant_daily_bars.api.testing import TestClient
+from webtest import TestApp
 
 
 def _ok_readiness():
@@ -312,6 +313,25 @@ class TestHealth:
         resp = client.get("/ready")
         assert resp.status_code == 503
         assert resp.json()["status"] == "not_ready"
+
+
+class TestCors:
+    def test_allows_any_origin_for_normal_and_preflight_requests(self):
+        client = TestApp(create_app())
+
+        response = client.get("/health", headers={"Origin": "http://localhost:3000"})
+        assert response.headers["Access-Control-Allow-Origin"] == "*"
+
+        response = client.options(
+            "/health",
+            headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert response.status_int == 200
+        assert response.headers["Access-Control-Allow-Origin"] == "*"
+        assert "GET" in response.headers["Access-Control-Allow-Methods"]
 
 
 class TestBarsEndpoints:
