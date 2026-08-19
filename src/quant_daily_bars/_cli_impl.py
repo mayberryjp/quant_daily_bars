@@ -8,6 +8,7 @@ import os
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 EXPECTED_SCHEMA_VERSION = "0003_vendor_bar_runs_heartbeat"
@@ -136,13 +137,25 @@ def bars_ingest(args: argparse.Namespace) -> None:
     )
 
     interval = getattr(args, "schedule", None)
-    run_once = interval is None
+    run_at = getattr(args, "run_at", None)
+    run_timezone = getattr(args, "timezone", "UTC")
+    run_once = interval is None and run_at is None
+
+    if interval is not None and run_at is not None:
+        raise SystemExit("error: --schedule and --run-at cannot be used together")
 
     # In one-shot mode, --from-date is required.
     if run_once and args.from_date is None and not args.fixture:
         raise SystemExit("error: --from-date is required for one-shot ingestion (or use --schedule for daily auto-ingest)")
 
     while True:
+        if run_at:
+            wait = _seconds_until_next_run_at(run_at, run_timezone)
+            logging.getLogger(__name__).info(
+                "next ingest at %s (%s) in %.0f seconds", run_at, run_timezone, wait,
+            )
+            time.sleep(wait)
+
         # In scheduled mode, automatically compute yesterday's date each cycle.
         if args.from_date is not None:
             from_date = args.from_date
@@ -219,8 +232,9 @@ def bars_ingest(args: argparse.Namespace) -> None:
         if run_once:
             break
 
-        logging.getLogger(__name__).info("next ingest in %d seconds", interval)
-        time.sleep(interval)
+        if interval:
+            logging.getLogger(__name__).info("next ingest in %d seconds", interval)
+            time.sleep(interval)
 
 
 def bars_backfill_gaps(args: argparse.Namespace) -> None:
@@ -390,6 +404,28 @@ def _seconds_until_next_jst_1930() -> float:
     if target <= now_jst:
         target += timedelta(days=1)
     return (target - now_jst).total_seconds()
+
+
+def _seconds_until_next_run_at(run_at: str, timezone_name: str = "UTC") -> float:
+    """Return seconds until the next HH:MM in the configured timezone."""
+    try:
+        target_time = datetime.strptime(run_at, "%H:%M").time()
+        timezone = ZoneInfo(timezone_name)
+    except (ValueError, KeyError) as exc:
+        raise SystemExit(
+            f"error: invalid run schedule (time={run_at!r}, timezone={timezone_name!r})"
+        ) from exc
+
+    now = datetime.now(timezone)
+    target = now.replace(
+        hour=target_time.hour,
+        minute=target_time.minute,
+        second=0,
+        microsecond=0,
+    )
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
 
 
 def _run_ingest_new_symbols(args: argparse.Namespace) -> None:
@@ -564,6 +600,14 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_parser.add_argument(
         "--schedule", type=int, metavar="SECONDS",
         help="Run continuously, sleeping SECONDS between ingests. Automatically ingests previous day's bars each cycle.",
+    )
+    ingest_parser.add_argument(
+        "--run-at", metavar="HH:MM",
+        help="Run once daily at HH:MM in the configured timezone. Does not run at startup.",
+    )
+    ingest_parser.add_argument(
+        "--timezone", default="UTC", metavar="ZONE",
+        help="IANA timezone for --run-at (default: UTC).",
     )
     ingest_parser.set_defaults(func=bars_ingest)
 

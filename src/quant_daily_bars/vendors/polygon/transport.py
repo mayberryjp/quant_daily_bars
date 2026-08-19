@@ -46,22 +46,25 @@ class UrllibTransport:
                 req.add_header(key, value)
         try:
             ctx = ssl.create_default_context()
-            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
-            body = resp.read()
-            resp_headers = {k: v for k, v in resp.headers.items()}
-            return TransportResponse(
-                status_code=resp.status,
-                headers=resp_headers,
-                body=body,
-            )
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                body = resp.read()
+                resp_headers = {k: v for k, v in resp.headers.items()}
+                return TransportResponse(
+                    status_code=resp.status,
+                    headers=resp_headers,
+                    body=body,
+                )
         except urllib.error.HTTPError as exc:
-            body = exc.read() if exc.fp else b""
-            resp_headers = {k: v for k, v in exc.headers.items()} if exc.headers else {}
-            return TransportResponse(
-                status_code=exc.code,
-                headers=resp_headers,
-                body=body,
-            )
+            try:
+                body = exc.read() if exc.fp else b""
+                resp_headers = {k: v for k, v in exc.headers.items()} if exc.headers else {}
+                return TransportResponse(
+                    status_code=exc.code,
+                    headers=resp_headers,
+                    body=body,
+                )
+            finally:
+                exc.close()
         except urllib.error.URLError as exc:
             if "timed out" in str(exc.reason):
                 raise PolygonTimeoutError(f"request timed out: {exc}") from exc
