@@ -20,7 +20,7 @@ from typing import Callable
 log = logging.getLogger(__name__)
 
 _DEFAULT_RATE_FILE = "/tmp/polygon_rate_limiter.json"
-_WINDOW = 60.0  # sliding window in seconds
+_WINDOW = 60.0  # default sliding window in seconds
 
 
 class SharedRateLimiter:
@@ -29,13 +29,18 @@ class SharedRateLimiter:
     Parameters
     ----------
     rpm : int
-        Maximum requests per 60-second window (across all processes).
+        Maximum requests allowed per ``window_seconds`` (across all processes).
+        Despite the name, this is not necessarily requests-per-minute — pair it
+        with ``window_seconds`` to express any rate (e.g. rpm=75,
+        window_seconds=1.0 caps throughput at 75 requests/second).
     rate_file : str
         Path to the shared JSON state file.
     sleep : callable
         Overridable sleep function (for testing).
     clock : callable
         Overridable monotonic clock (for testing).
+    window_seconds : float
+        Length of the sliding window, in seconds. Defaults to 60s.
     """
 
     def __init__(
@@ -45,8 +50,10 @@ class SharedRateLimiter:
         rate_file: str | None = None,
         sleep: Callable[[float], None] | None = None,
         clock: Callable[[], float] | None = None,
+        window_seconds: float = _WINDOW,
     ) -> None:
         self.rpm = rpm
+        self.window_seconds = window_seconds
         self.rate_file = rate_file or os.environ.get(
             "POLYGON_RATE_FILE", _DEFAULT_RATE_FILE,
         )
@@ -65,7 +72,7 @@ class SharedRateLimiter:
                 now = self._clock()
 
                 # Discard entries older than the window
-                timestamps = [t for t in timestamps if now - t < _WINDOW]
+                timestamps = [t for t in timestamps if now - t < self.window_seconds]
 
                 if len(timestamps) < self.rpm:
                     # Slot available — record and return
@@ -75,7 +82,7 @@ class SharedRateLimiter:
 
                 # Need to wait — compute how long
                 oldest = timestamps[0]
-                wait = _WINDOW - (now - oldest) + 0.1
+                wait = self.window_seconds - (now - oldest) + 0.1
 
             log.info(
                 "shared rate limit: %d/%d in window, waiting %.1fs",

@@ -7,7 +7,10 @@ into the market_data.daily_bars table with idempotent upserts.
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
@@ -22,6 +25,8 @@ from quant_daily_bars.vendors.polygon.models import AggregateBar
 
 
 log = logging.getLogger(__name__)
+
+_DEFAULT_FETCH_WORKERS = 25
 
 
 @dataclass(frozen=True)
@@ -86,9 +91,18 @@ UPSERT_MISSING_BAR = text("""
 class DailyBarIngestJob:
     """Orchestrates daily bar ingestion from Polygon into Postgres."""
 
-    def __init__(self, *, engine: Engine | None = None, client: PolygonBarsClient | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        engine: Engine | None = None,
+        client: PolygonBarsClient | None = None,
+        fetch_workers: int | None = None,
+    ) -> None:
         self._engine = engine
         self._client = client
+        if fetch_workers is None:
+            fetch_workers = int(os.environ.get("INGEST_FETCH_WORKERS", str(_DEFAULT_FETCH_WORKERS)))
+        self._fetch_workers = max(1, fetch_workers)
 
     def run(self, options: IngestOptions) -> IngestSummary:
         started = time.monotonic()
@@ -113,26 +127,43 @@ class DailyBarIngestJob:
         run_id = self._create_run(options, len(targets))
         summary.run_id = run_id
 
-        for target in targets:
-            try:
-                bars_count = self._ingest_symbol(target, options, run_id)
-                summary.bars_upserted += bars_count
-                summary.symbols_succeeded += 1
-                if bars_count == 0:
-                    self._record_missing(target, options, run_id, "no bars returned by vendor")
-                    summary.missing_bars_recorded += 1
-                    summary.warnings.append(f"{target.ticker}: no bars returned")
-            except PolygonError as exc:
-                summary.symbols_failed += 1
-                summary.errors += 1
-                summary.failures.append(f"{target.ticker}: {exc}")
-                log.error("failed to ingest %s: %s", target.ticker, exc)
-            except Exception as exc:
-                summary.symbols_failed += 1
-                summary.errors += 1
-                summary.failures.append(f"{target.ticker}: {exc}")
-                log.error("unexpected error ingesting %s: %s", target.ticker, exc, exc_info=True)
-            self._heartbeat(run_id)
+        # Symbols are independent, so fetch/upsert them concurrently. The shared
+        # cross-process rate limiter (see PolygonBarsClient) still caps the
+        # combined request rate, so concurrency here just keeps that budget
+        # saturated instead of leaving it idle between sequential requests.
+        summary_lock = threading.Lock()
+        worker_count = min(self._fetch_workers, len(targets))
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="bar-fetch") as executor:
+            future_to_target = {
+                executor.submit(self._ingest_symbol, target, options, run_id): target
+                for target in targets
+            }
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                try:
+                    bars_count = future.result()
+                    with summary_lock:
+                        summary.bars_upserted += bars_count
+                        summary.symbols_succeeded += 1
+                        if bars_count == 0:
+                            summary.missing_bars_recorded += 1
+                            summary.warnings.append(f"{target.ticker}: no bars returned")
+                    if bars_count == 0:
+                        self._record_missing(target, options, run_id, "no bars returned by vendor")
+                except PolygonError as exc:
+                    with summary_lock:
+                        summary.symbols_failed += 1
+                        summary.errors += 1
+                        summary.failures.append(f"{target.ticker}: {exc}")
+                    log.error("failed to ingest %s: %s", target.ticker, exc)
+                except Exception as exc:
+                    with summary_lock:
+                        summary.symbols_failed += 1
+                        summary.errors += 1
+                        summary.failures.append(f"{target.ticker}: {exc}")
+                    log.error("unexpected error ingesting %s: %s", target.ticker, exc, exc_info=True)
+                self._heartbeat(run_id)
 
         summary.status = "failed" if summary.errors > 0 and summary.symbols_succeeded == 0 else "ok"
         summary.duration_seconds = time.monotonic() - started

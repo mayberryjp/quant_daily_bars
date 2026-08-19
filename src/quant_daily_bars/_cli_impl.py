@@ -45,7 +45,7 @@ def _engine() -> object:
         from sqlalchemy import create_engine
     except ModuleNotFoundError as exc:
         raise SystemExit("SQLAlchemy is required for database commands") from exc
-    return create_engine(_database_url(), pool_pre_ping=True)
+    return create_engine(_database_url(), pool_pre_ping=True, pool_size=20, max_overflow=20)
 
 
 # ── db commands ─────────────────────────────────────────────────────────────

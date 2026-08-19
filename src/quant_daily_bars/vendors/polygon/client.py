@@ -53,7 +53,8 @@ class PolygonBarsClient:
         self._transport = transport or UrllibTransport()
         self._sleep = sleep or time.sleep
         self._rate_limiter = rate_limiter or SharedRateLimiter(
-            rpm=config.rate_limit_rpm,
+            rpm=config.rate_limit_rps,
+            window_seconds=1.0,
             sleep=self._sleep,
         )
 

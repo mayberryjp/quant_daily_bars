@@ -15,6 +15,7 @@ DEFAULT_RETRY_COUNT = 3
 DEFAULT_BACKOFF_SECONDS = 0.5
 DEFAULT_BACKOFF_MULTIPLIER = 2.0
 DEFAULT_RATE_LIMIT_RPM = 30
+DEFAULT_RATE_LIMIT_RPS = 75
 
 
 def _env_value(name: str) -> str | None:
@@ -64,7 +65,8 @@ class PolygonConfig:
     retry_count: int = DEFAULT_RETRY_COUNT
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS
     backoff_multiplier: float = DEFAULT_BACKOFF_MULTIPLIER
-    rate_limit_rpm: int = DEFAULT_RATE_LIMIT_RPM
+    rate_limit_rpm: int = DEFAULT_RATE_LIMIT_RPM  # legacy, superseded by rate_limit_rps
+    rate_limit_rps: int = DEFAULT_RATE_LIMIT_RPS
 
     def __post_init__(self) -> None:
         if not self.base_url:
@@ -87,7 +89,8 @@ class PolygonConfig:
             f"retry_count={self.retry_count!r}, "
             f"backoff_seconds={self.backoff_seconds!r}, "
             f"backoff_multiplier={self.backoff_multiplier!r}, "
-            f"rate_limit_rpm={self.rate_limit_rpm!r})"
+            f"rate_limit_rpm={self.rate_limit_rpm!r}, "
+            f"rate_limit_rps={self.rate_limit_rps!r})"
         )
 
     @classmethod
@@ -109,5 +112,9 @@ class PolygonConfig:
             rate_limit_rpm=_int_from_env(
                 "MASSIVE_RATE_LIMIT_RPM",
                 DEFAULT_RATE_LIMIT_RPM,
+            ),
+            rate_limit_rps=_int_from_env(
+                "MASSIVE_RATE_LIMIT_RPS",
+                DEFAULT_RATE_LIMIT_RPS,
             ),
         )
