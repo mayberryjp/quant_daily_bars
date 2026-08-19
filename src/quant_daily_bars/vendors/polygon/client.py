@@ -23,8 +23,8 @@ from quant_daily_bars.vendors.polygon.errors import (
 from quant_daily_bars.vendors.polygon.models import AggregatesPage
 from quant_daily_bars.vendors.polygon.rate_limiter import SharedRateLimiter
 from quant_daily_bars.vendors.polygon.transport import (
+    RequestsTransport,
     Transport,
-    UrllibTransport,
     decode_json_body,
 )
 
@@ -50,7 +50,7 @@ class PolygonBarsClient:
         rate_limiter: SharedRateLimiter | None = None,
     ) -> None:
         self.config = config
-        self._transport = transport or UrllibTransport()
+        self._transport = transport or RequestsTransport()
         self._sleep = sleep or time.sleep
         self._rate_limiter = rate_limiter or SharedRateLimiter(
             rpm=config.rate_limit_rps,
