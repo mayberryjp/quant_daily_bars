@@ -69,7 +69,7 @@ def list_bars(params: BarListParams) -> dict[str, Any]:
                            d.fetched_at, d.vendor_bar_run_id
                     FROM market_data.daily_bars d
                     {where_clause}
-                    ORDER BY d.bar_date ASC, d.ticker ASC
+                    ORDER BY d.bar_date DESC, d.ticker ASC
                     LIMIT :limit OFFSET :offset
                 """),
                 values,
