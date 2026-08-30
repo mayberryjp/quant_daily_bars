@@ -156,6 +156,12 @@ def bars_ingest(args: argparse.Namespace) -> None:
             )
             time.sleep(wait)
 
+            if datetime.now(ZoneInfo(run_timezone)).weekday() >= 5:
+                logging.getLogger(__name__).info(
+                    "skipping ingest: weekend in %s", run_timezone,
+                )
+                continue
+
         # In scheduled mode, automatically compute yesterday's date each cycle.
         if args.from_date is not None:
             from_date = args.from_date
