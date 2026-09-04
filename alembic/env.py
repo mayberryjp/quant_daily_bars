@@ -2,7 +2,7 @@ from logging.config import fileConfig
 import os
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 
 config = context.config
 
@@ -22,7 +22,41 @@ def _database_url() -> str:
 # Use a dedicated version table so this repo's migrations don't collide
 # with quant_symbols (which uses the default public.alembic_version).
 VERSION_TABLE = "alembic_version_daily_bars"
-VERSION_TABLE_SCHEMA = "market_data"
+VERSION_TABLE_SCHEMA = "daily_bars"
+LEGACY_VERSION_TABLE_SCHEMA = "market_data"
+
+
+def _relocate_version_table(connection) -> None:
+    """Move the alembic version table into daily_bars before it is read.
+
+    Migration 0004 renames this service's schema from market_data to daily_bars,
+    but alembic reads and writes its own version table while that migration runs,
+    so the version table itself must be relocated out-of-band here. This is a
+    no-op on a fresh database and once the move has already happened.
+    """
+    connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{VERSION_TABLE_SCHEMA}"'))
+    connection.execute(
+        text(
+            f"""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = '{LEGACY_VERSION_TABLE_SCHEMA}'
+                      AND table_name = '{VERSION_TABLE}'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = '{VERSION_TABLE_SCHEMA}'
+                      AND table_name = '{VERSION_TABLE}'
+                ) THEN
+                    ALTER TABLE {LEGACY_VERSION_TABLE_SCHEMA}.{VERSION_TABLE}
+                        SET SCHEMA {VERSION_TABLE_SCHEMA};
+                END IF;
+            END $$;
+            """
+        )
+    )
+    connection.commit()
 
 
 def run_migrations_offline() -> None:
@@ -50,6 +84,7 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        _relocate_version_table(connection)
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

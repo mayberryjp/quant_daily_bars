@@ -24,15 +24,15 @@ python3 -m quant_daily_bars.cli db verify
 
 ## Database Schema
 
-The migration creates the `market_data` schema with these tables:
+The migrations create the `daily_bars` schema with these tables:
 
 | Table | Purpose |
 |-------|---------|
-| `market_data.vendor_bar_sources` | Registered bar data vendors (seeded with `polygon`) |
-| `market_data.vendor_bar_runs` | Per-run tracking for ingestion jobs (mode, dates, counts, duration) |
-| `market_data.daily_bars` | OHLCV bars keyed by `(symbol_id, bar_date, adjustment_type)` |
-| `market_data.corporate_actions` | Splits, dividends, symbol changes (placeholder for future use) |
-| `market_data.missing_bars` | Bars expected but not returned, for operator inspection |
+| `daily_bars.vendor_bar_sources` | Registered bar data vendors (seeded with `polygon`) |
+| `daily_bars.vendor_bar_runs` | Per-run tracking for ingestion jobs (mode, dates, counts, duration) |
+| `daily_bars.daily_bars` | OHLCV bars keyed by `(symbol_id, bar_date, adjustment_type)` |
+| `daily_bars.corporate_actions` | Splits, dividends, symbol changes (placeholder for future use) |
+| `daily_bars.missing_bars` | Bars expected but not returned, for operator inspection |
 
 Apply migrations:
 
@@ -67,11 +67,13 @@ and duration for each ingestion job.
 
 ### Symbol Identity
 
-`daily_bars.symbol_id` is a logical foreign key to `symbol_master.symbols.id`
-from the `quant_symbols` service. When databases are separate, this is enforced
-at the application level. The `ticker` column is denormalized for query
-convenience but `symbol_id` is the stable identity—tickers can change due to
-corporate actions while `symbol_id` remains constant.
+The `symbol_id` column in `daily_bars.daily_bars` is a logical foreign key to a
+symbol owned by the separate `quant_symbols` service. Symbols are resolved over
+the quant_symbols HTTP API rather than by joining across database schemas — set
+`SYMBOLS_API_URL` to the base URL of that API (default `http://localhost:8000`).
+The `ticker` column is denormalized for query convenience but `symbol_id` is the
+stable identity—tickers can change due to corporate actions while `symbol_id`
+remains constant.
 
 ## CLI Usage
 
@@ -88,7 +90,7 @@ MASSIVE_API_KEY=... python3 -m quant_daily_bars.cli bars ingest \
     --from-date 2024-01-01 --to-date 2024-06-01 \
     --tickers AAPL,MSFT --mode backfill
 
-# Live backfill for all active symbols in symbol_master
+# Live backfill for all active symbols from the symbols service
 MASSIVE_API_KEY=... python3 -m quant_daily_bars.cli bars ingest \
     --from-date 2024-01-01 --to-date 2024-06-01
 ```

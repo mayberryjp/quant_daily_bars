@@ -11,7 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
-EXPECTED_SCHEMA_VERSION = "0003_vendor_bar_runs_heartbeat"
+EXPECTED_SCHEMA_VERSION = "0004_rename_schema_to_daily_bars"
 EXPECTED_TABLES = (
     "corporate_actions",
     "daily_bars",
@@ -70,20 +70,20 @@ def db_verify(_args: argparse.Namespace) -> None:
     with engine.connect() as connection:
         connection.execute(text("SELECT 1")).scalar_one()
         schema_version = connection.execute(
-            text("SELECT version_num FROM market_data.alembic_version_daily_bars")
+            text("SELECT version_num FROM daily_bars.alembic_version_daily_bars")
         ).scalar_one()
         tables = connection.execute(
             text("""
                 SELECT table_name
                 FROM information_schema.tables
-                WHERE table_schema = 'market_data'
+                WHERE table_schema = 'daily_bars'
                   AND table_type = 'BASE TABLE'
                   AND table_name != 'alembic_version_daily_bars'
                 ORDER BY table_name
             """)
         ).scalars().all()
         vendor_sources = connection.execute(
-            text("SELECT count(*) FROM market_data.vendor_bar_sources")
+            text("SELECT count(*) FROM daily_bars.vendor_bar_sources")
         ).scalar_one()
 
     if schema_version != EXPECTED_SCHEMA_VERSION:
@@ -248,6 +248,7 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
     from sqlalchemy import text as sa_text
 
     from quant_daily_bars.ingest.job import DailyBarIngestJob, IngestOptions
+    from quant_daily_bars.symbols.client import SymbolsApiClient, SymbolsApiError
     from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
     from quant_daily_bars.vendors.polygon.errors import (
         PolygonAuthError,
@@ -259,6 +260,7 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
     run_once = interval is None
     gap_start = args.from_date
     log = logging.getLogger(__name__)
+    symbols_client = SymbolsApiClient.from_env()
 
     while True:
         yesterday = date.today() - timedelta(days=1)
@@ -280,15 +282,15 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
             time.sleep(interval)
             continue
 
-        # Find active symbols and their missing date ranges
-        with engine.connect() as conn:
-            symbols = conn.execute(
-                sa_text("""
-                    SELECT id, canonical_ticker FROM symbol_master.symbols
-                    WHERE active = true
-                    ORDER BY canonical_ticker
-                """)
-            ).fetchall()
+        # Find active symbols (from the symbols service) and their missing date ranges
+        try:
+            symbols = symbols_client.list_active_symbols()
+        except SymbolsApiError as exc:
+            log.error("could not list active symbols: %s", exc)
+            if run_once:
+                raise SystemExit(1) from exc
+            time.sleep(interval)
+            continue
 
         if not symbols:
             log.warning("no active symbols found")
@@ -301,13 +303,14 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
         total_symbols_with_gaps = 0
         total_symbols_skipped = 0
 
-        for sym_id, ticker in symbols:
+        for symbol in symbols:
+            sym_id, ticker = symbol.symbol_id, symbol.ticker
             # Check if already backfilled for this range
             with engine.connect() as conn:
                 status_row = conn.execute(
                     sa_text("""
                         SELECT query_start_date, query_end_date, bars_returned
-                        FROM market_data.symbol_backfill_status
+                        FROM daily_bars.symbol_backfill_status
                         WHERE symbol_id = :symbol_id
                     """),
                     {"symbol_id": sym_id},
@@ -339,12 +342,12 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
                 with engine.connect() as conn:
                     conn.execute(
                         sa_text("""
-                            INSERT INTO market_data.symbol_backfill_status
+                            INSERT INTO daily_bars.symbol_backfill_status
                                 (symbol_id, ticker, query_start_date, query_end_date, bars_returned, last_queried_at)
                             VALUES (:symbol_id, :ticker, :start, :end, :bars, now())
                             ON CONFLICT (symbol_id) DO UPDATE SET
-                                query_start_date = LEAST(market_data.symbol_backfill_status.query_start_date, :start),
-                                query_end_date = GREATEST(market_data.symbol_backfill_status.query_end_date, :end),
+                                query_start_date = LEAST(daily_bars.symbol_backfill_status.query_start_date, :start),
+                                query_end_date = GREATEST(daily_bars.symbol_backfill_status.query_end_date, :end),
                                 bars_returned = :bars,
                                 last_queried_at = now()
                         """),
@@ -439,6 +442,7 @@ def _run_ingest_new_symbols(args: argparse.Namespace) -> None:
     from sqlalchemy import text as sa_text
 
     from quant_daily_bars.ingest.job import DailyBarIngestJob, IngestOptions
+    from quant_daily_bars.symbols.client import SymbolsApiClient, SymbolsApiError
     from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
     from quant_daily_bars.vendors.polygon.errors import (
         PolygonAuthError,
@@ -459,25 +463,25 @@ def _run_ingest_new_symbols(args: argparse.Namespace) -> None:
         print("  Hint: set MASSIVE_API_KEY in your environment or .env file.")
         raise SystemExit(1) from exc
 
-    # Find active symbols that have zero rows in daily_bars
-    with engine.connect() as conn:
-        rows = conn.execute(
-            sa_text("""
-                SELECT s.id, s.canonical_ticker
-                FROM symbol_master.symbols s
-                LEFT JOIN market_data.daily_bars db ON db.symbol_id = s.id
-                WHERE s.active = true
-                GROUP BY s.id, s.canonical_ticker
-                HAVING COUNT(db.symbol_id) = 0
-                ORDER BY s.canonical_ticker
-            """)
-        ).fetchall()
+    # Find active symbols (from the symbols service) that have zero rows in daily_bars
+    symbols_client = SymbolsApiClient.from_env()
+    try:
+        active_symbols = symbols_client.list_active_symbols()
+    except SymbolsApiError as exc:
+        print(f"ERROR: could not list active symbols: {exc}")
+        raise SystemExit(1) from exc
 
-    if not rows:
+    with engine.connect() as conn:
+        symbol_ids_with_bars = set(
+            conn.execute(sa_text("SELECT DISTINCT symbol_id FROM daily_bars.daily_bars")).scalars().all()
+        )
+
+    new_symbols = [s for s in active_symbols if s.symbol_id not in symbol_ids_with_bars]
+    if not new_symbols:
         print("ingest_new_symbols  symbols_found=0  (all active symbols already have bars)")
         return
 
-    tickers = [r[1] for r in rows]
+    tickers = sorted(s.ticker for s in new_symbols)
     log.info("found %d symbols with no bars: %s", len(tickers), ", ".join(tickers[:20]))
 
     options = IngestOptions(

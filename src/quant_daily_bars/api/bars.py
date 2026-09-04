@@ -67,7 +67,7 @@ def list_bars(params: BarListParams) -> dict[str, Any]:
                            d.adjustment_type, d.open, d.high, d.low, d.close,
                            d.volume, d.vwap, d.transactions,
                            d.fetched_at, d.vendor_bar_run_id
-                    FROM market_data.daily_bars d
+                    FROM daily_bars.daily_bars d
                     {where_clause}
                     ORDER BY d.bar_date DESC, d.ticker ASC
                     LIMIT :limit OFFSET :offset
@@ -99,7 +99,7 @@ def get_bar_summary(ticker: str) -> dict[str, Any] | None:
                            MAX(d.bar_date) AS last_date,
                            COUNT(*) AS bar_count,
                            d.adjustment_type
-                    FROM market_data.daily_bars d
+                    FROM daily_bars.daily_bars d
                     WHERE d.ticker = :ticker
                     GROUP BY d.ticker, d.symbol_id, d.adjustment_type
                 """),
@@ -133,7 +133,7 @@ def list_tickers_coverage() -> dict[str, Any]:
                            MIN(d.bar_date) AS first_date,
                            MAX(d.bar_date) AS last_date,
                            COUNT(*) AS bar_count
-                    FROM market_data.daily_bars d
+                    FROM daily_bars.daily_bars d
                     GROUP BY d.ticker, d.symbol_id
                     ORDER BY d.ticker
                 """)
@@ -179,8 +179,8 @@ def list_ingest_runs(params: IngestRunListParams) -> dict[str, Any]:
                            r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
                            r.bars_upserted, r.errors, r.error_message,
                            r.duration_seconds, r.started_at, r.finished_at
-                    FROM market_data.vendor_bar_runs r
-                    JOIN market_data.vendor_bar_sources s ON s.id = r.vendor_source_id
+                    FROM daily_bars.vendor_bar_runs r
+                    JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
                     {where_clause}
                     ORDER BY r.id DESC
                     LIMIT :limit OFFSET :offset
@@ -212,8 +212,8 @@ def get_ingest_run(run_id: int) -> dict[str, Any] | None:
                            r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
                            r.bars_upserted, r.errors, r.error_message,
                            r.duration_seconds, r.started_at, r.finished_at
-                    FROM market_data.vendor_bar_runs r
-                    JOIN market_data.vendor_bar_sources s ON s.id = r.vendor_source_id
+                    FROM daily_bars.vendor_bar_runs r
+                    JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
                     WHERE r.id = :run_id
                 """),
                 {"run_id": run_id},
@@ -239,8 +239,8 @@ def get_latest_ingest_run() -> dict[str, Any] | None:
                            r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
                            r.bars_upserted, r.errors, r.error_message,
                            r.duration_seconds, r.started_at, r.finished_at
-                    FROM market_data.vendor_bar_runs r
-                    JOIN market_data.vendor_bar_sources s ON s.id = r.vendor_source_id
+                    FROM daily_bars.vendor_bar_runs r
+                    JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
                     ORDER BY r.id DESC
                     LIMIT 1
                 """),
@@ -269,7 +269,7 @@ def get_missing_bars(ticker: str | None = None, limit: int = 100, offset: int = 
                 text(f"""
                     SELECT m.id, m.symbol_id, m.ticker, m.bar_date,
                            m.reason, m.vendor_bar_run_id, m.created_at
-                    FROM market_data.missing_bars m
+                    FROM daily_bars.missing_bars m
                     {where_clause}
                     ORDER BY m.bar_date DESC, m.ticker ASC
                     LIMIT :limit OFFSET :offset
@@ -306,7 +306,7 @@ def get_bar_date_range() -> dict[str, Any] | None:
                            MAX(bar_date) AS last_date,
                            COUNT(*) AS total_bars,
                            COUNT(DISTINCT bar_date) AS unique_days
-                    FROM market_data.daily_bars
+                    FROM daily_bars.daily_bars
                 """)
             ).mappings().first()
     finally:
@@ -323,26 +323,31 @@ def get_bar_date_range() -> dict[str, Any] | None:
     }
 
 
-def get_backfill_progress(from_date: str = "2025-06-01") -> dict[str, Any]:
+def get_backfill_progress(from_date: str = "2025-06-01", symbols_client=None) -> dict[str, Any]:
     from datetime import date, timedelta
-    from sqlalchemy import text
+    from sqlalchemy import bindparam, Integer, text
+    from sqlalchemy.dialects.postgresql import ARRAY
+
+    from quant_daily_bars.symbols.client import SymbolsApiClient
+
+    if symbols_client is None:
+        symbols_client = SymbolsApiClient.from_env()
 
     start = date.fromisoformat(from_date)
     yesterday = date.today() - timedelta(days=1)
 
+    # Active symbols come from the symbols service, not a cross-schema join.
+    active_ids = [s.symbol_id for s in symbols_client.list_active_symbols()]
+    active_symbols = len(active_ids)
+
     engine = _engine()
     try:
         with engine.connect() as conn:
-            # Active symbols count
-            active_symbols = conn.execute(
-                text("SELECT COUNT(*) FROM symbol_master.symbols WHERE active = true")
-            ).scalar_one()
-
             # Build trading calendar: dates where >=5 symbols have bars
             trading_days_rows = conn.execute(
                 text("""
                     SELECT bar_date
-                    FROM market_data.daily_bars
+                    FROM daily_bars.daily_bars
                     WHERE bar_date >= :start AND bar_date <= :end
                       AND adjustment_type = 'unadjusted'
                     GROUP BY bar_date
@@ -353,38 +358,42 @@ def get_backfill_progress(from_date: str = "2025-06-01") -> dict[str, Any]:
             ).scalars().all()
             trading_day_count = len(trading_days_rows)
 
-            # Aggregate backfill stats
-            backfill_stats = conn.execute(
-                text("""
+            # Aggregate backfill stats over the active symbol universe.
+            if active_ids:
+                backfill_stmt = text("""
                     SELECT
                         COUNT(*) FILTER (WHERE b.last_queried_at IS NOT NULL) AS symbols_queried,
                         COUNT(*) FILTER (WHERE b.last_queried_at IS NULL) AS symbols_not_queried,
                         COUNT(*) FILTER (WHERE bar_counts.bars_have > 0) AS symbols_with_bars,
                         COUNT(*) FILTER (WHERE bar_counts.bars_have = 0 OR bar_counts.bars_have IS NULL) AS symbols_no_bars,
                         COALESCE(SUM(bar_counts.bars_have), 0) AS total_bars_have
-                    FROM symbol_master.symbols s
-                    LEFT JOIN market_data.symbol_backfill_status b
+                    FROM unnest(:active_ids) AS s(id)
+                    LEFT JOIN daily_bars.symbol_backfill_status b
                         ON b.symbol_id = s.id
                     LEFT JOIN LATERAL (
                         SELECT COUNT(d.bar_date) AS bars_have
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         WHERE d.symbol_id = s.id
                           AND d.bar_date >= :start
                           AND d.bar_date <= :end
                           AND d.adjustment_type = 'unadjusted'
                     ) bar_counts ON true
-                    WHERE s.active = true
-                """),
-                {"start": start, "end": yesterday},
-            ).mappings().one()
+                """).bindparams(bindparam("active_ids", type_=ARRAY(Integer)))
+                backfill_stats = conn.execute(
+                    backfill_stmt,
+                    {"active_ids": active_ids, "start": start, "end": yesterday},
+                ).mappings().one()
+                symbols_queried = int(backfill_stats["symbols_queried"])
+                symbols_not_queried = int(backfill_stats["symbols_not_queried"])
+                symbols_with_bars = int(backfill_stats["symbols_with_bars"])
+                symbols_no_bars = int(backfill_stats["symbols_no_bars"])
+                total_bars_have = int(backfill_stats["total_bars_have"])
+            else:
+                symbols_queried = symbols_not_queried = 0
+                symbols_with_bars = symbols_no_bars = 0
+                total_bars_have = 0
     finally:
         engine.dispose()
-
-    symbols_queried = int(backfill_stats["symbols_queried"])
-    symbols_not_queried = int(backfill_stats["symbols_not_queried"])
-    symbols_with_bars = int(backfill_stats["symbols_with_bars"])
-    symbols_no_bars = int(backfill_stats["symbols_no_bars"])
-    total_bars_have = int(backfill_stats["total_bars_have"])
 
     pct = (symbols_queried / active_symbols * 100) if active_symbols > 0 else 0.0
 
@@ -409,6 +418,7 @@ def get_coverage_gaps(
     adjustment_type: str = "unadjusted",
     limit: int = 1000,
     offset: int = 0,
+    symbols_client=None,
 ) -> dict[str, Any] | None:
     """Per-day cross-symbol coverage using a reference symbol as the trading calendar.
 
@@ -416,7 +426,15 @@ def get_coverage_gaps(
     symbols have a bar that day and how many are missing one. Returns ``None`` when
     the reference symbol has no bars in the requested window.
     """
-    from sqlalchemy import text
+    from sqlalchemy import bindparam, Integer, text
+    from sqlalchemy.dialects.postgresql import ARRAY
+
+    from quant_daily_bars.symbols.client import SymbolsApiClient
+
+    if symbols_client is None:
+        symbols_client = SymbolsApiClient.from_env()
+
+    active_ids = [s.symbol_id for s in symbols_client.list_active_symbols()]
 
     engine = _engine()
     try:
@@ -424,6 +442,7 @@ def get_coverage_gaps(
             values: dict[str, Any] = {
                 "reference_ticker": reference_ticker,
                 "adjustment_type": adjustment_type,
+                "active_ids": active_ids,
                 "limit": limit,
                 "offset": offset,
             }
@@ -436,14 +455,10 @@ def get_coverage_gaps(
                 values["to_date"] = to_date
             date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
 
-            active_symbols = conn.execute(
-                text("SELECT COUNT(*) FROM symbol_master.symbols WHERE active = true")
-            ).scalar_one()
-
             total_days = conn.execute(
                 text(f"""
                     SELECT COUNT(DISTINCT d.bar_date)
-                    FROM market_data.daily_bars d
+                    FROM daily_bars.daily_bars d
                     WHERE d.ticker = :reference_ticker
                       AND d.adjustment_type = :adjustment_type
                       {date_clause}
@@ -458,18 +473,17 @@ def get_coverage_gaps(
                 text(f"""
                     WITH calendar AS (
                         SELECT DISTINCT d.bar_date
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         WHERE d.ticker = :reference_ticker
                           AND d.adjustment_type = :adjustment_type
                           {date_clause}
                     ),
                     per_day AS (
                         SELECT d.bar_date, COUNT(DISTINCT d.symbol_id) AS symbols_with_bar
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         JOIN calendar c ON c.bar_date = d.bar_date
-                        JOIN symbol_master.symbols s
-                            ON s.id = d.symbol_id AND s.active = true
                         WHERE d.adjustment_type = :adjustment_type
+                          AND d.symbol_id = ANY(:active_ids)
                         GROUP BY d.bar_date
                     )
                     SELECT c.bar_date,
@@ -478,13 +492,13 @@ def get_coverage_gaps(
                     LEFT JOIN per_day p ON p.bar_date = c.bar_date
                     ORDER BY c.bar_date ASC
                     LIMIT :limit OFFSET :offset
-                """),
+                """).bindparams(bindparam("active_ids", type_=ARRAY(Integer))),
                 values,
             ).mappings().all()
     finally:
         engine.dispose()
 
-    active_total = int(active_symbols)
+    active_total = len(active_ids)
     items = []
     days_with_gaps = 0
     for row in rows:
@@ -552,7 +566,7 @@ def get_gap_symbols(
             trading_days = conn.execute(
                 text(f"""
                     SELECT COUNT(DISTINCT d.bar_date)
-                    FROM market_data.daily_bars d
+                    FROM daily_bars.daily_bars d
                     WHERE d.ticker = :reference_ticker
                       AND d.adjustment_type = :adjustment_type
                       {date_clause}
@@ -567,7 +581,7 @@ def get_gap_symbols(
                 text(f"""
                     WITH calendar AS (
                         SELECT DISTINCT d.bar_date
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         WHERE d.ticker = :reference_ticker
                           AND d.adjustment_type = :adjustment_type
                           {date_clause}
@@ -576,7 +590,7 @@ def get_gap_symbols(
                         SELECT d.symbol_id, d.ticker,
                                MIN(d.bar_date) AS first_date,
                                MAX(d.bar_date) AS last_date
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         WHERE d.adjustment_type = :adjustment_type
                         GROUP BY d.symbol_id, d.ticker
                     ),
@@ -590,7 +604,7 @@ def get_gap_symbols(
                     ),
                     present AS (
                         SELECT d.symbol_id, COUNT(DISTINCT d.bar_date) AS present_days
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         JOIN calendar c ON c.bar_date = d.bar_date
                         WHERE d.adjustment_type = :adjustment_type
                         GROUP BY d.symbol_id
@@ -676,7 +690,7 @@ def get_gap_dates(
             trading_days = conn.execute(
                 text(f"""
                     SELECT COUNT(DISTINCT d.bar_date)
-                    FROM market_data.daily_bars d
+                    FROM daily_bars.daily_bars d
                     WHERE d.ticker = :reference_ticker
                       AND d.adjustment_type = :adjustment_type
                       {date_clause}
@@ -691,7 +705,7 @@ def get_gap_dates(
                 text(f"""
                     WITH calendar AS (
                         SELECT DISTINCT d.bar_date
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         WHERE d.ticker = :reference_ticker
                           AND d.adjustment_type = :adjustment_type
                           {date_clause}
@@ -700,7 +714,7 @@ def get_gap_dates(
                         SELECT d.symbol_id,
                                MIN(d.bar_date) AS first_date,
                                MAX(d.bar_date) AS last_date
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         WHERE d.adjustment_type = :adjustment_type
                         GROUP BY d.symbol_id
                     ),
@@ -713,7 +727,7 @@ def get_gap_dates(
                     ),
                     present AS (
                         SELECT d.bar_date, COUNT(DISTINCT d.symbol_id) AS symbols_present
-                        FROM market_data.daily_bars d
+                        FROM daily_bars.daily_bars d
                         JOIN calendar c ON c.bar_date = d.bar_date
                         WHERE d.adjustment_type = :adjustment_type
                         GROUP BY d.bar_date

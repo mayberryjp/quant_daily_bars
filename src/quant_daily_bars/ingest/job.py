@@ -1,7 +1,7 @@
 """Daily bar ingestion job.
 
 Implements backfill and incremental ingest of OHLCV daily bars from Polygon
-into the market_data.daily_bars table with idempotent upserts.
+into the daily_bars.daily_bars table with idempotent upserts.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from quant_daily_bars.ingest.summary import IngestSummary
+from quant_daily_bars.symbols.client import SymbolsApiClient
 from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
 from quant_daily_bars.vendors.polygon.errors import PolygonError
 from quant_daily_bars.vendors.polygon.models import AggregateBar
@@ -41,7 +42,7 @@ class IngestOptions:
     """Parameters for a bar ingestion run."""
     from_date: date
     to_date: date
-    tickers: list[str] | None = None  # None means use all active symbols from symbol_master
+    tickers: list[str] | None = None  # None means use all active symbols from the symbols service
     adjustment_type: str = "unadjusted"
     mode: str = "backfill"  # 'backfill' or 'incremental'
     fixture_path: str | None = None
@@ -51,7 +52,7 @@ class IngestOptions:
 # ── Upsert SQL ──────────────────────────────────────────────────────────────
 
 UPSERT_DAILY_BAR = text("""
-    INSERT INTO market_data.daily_bars (
+    INSERT INTO daily_bars.daily_bars (
         symbol_id, ticker, bar_date, adjustment_type,
         open, high, low, close, volume, vwap, transactions,
         vendor_source_id, vendor_bar_run_id, fetched_at, updated_at
@@ -76,7 +77,7 @@ UPSERT_DAILY_BAR = text("""
 """)
 
 UPSERT_MISSING_BAR = text("""
-    INSERT INTO market_data.missing_bars (
+    INSERT INTO daily_bars.missing_bars (
         symbol_id, ticker, bar_date, vendor_source_id, vendor_bar_run_id, reason
     ) VALUES (
         :symbol_id, :ticker, :bar_date, :vendor_source_id, :vendor_bar_run_id, :reason
@@ -96,13 +97,21 @@ class DailyBarIngestJob:
         *,
         engine: Engine | None = None,
         client: PolygonBarsClient | None = None,
+        symbols_client: SymbolsApiClient | None = None,
         fetch_workers: int | None = None,
     ) -> None:
         self._engine = engine
         self._client = client
+        self._symbols_client = symbols_client
         if fetch_workers is None:
             fetch_workers = int(os.environ.get("INGEST_FETCH_WORKERS", str(_DEFAULT_FETCH_WORKERS)))
         self._fetch_workers = max(1, fetch_workers)
+
+    def _symbols(self) -> SymbolsApiClient:
+        """Return the symbols API client, building one from the environment if needed."""
+        if self._symbols_client is None:
+            self._symbols_client = SymbolsApiClient.from_env()
+        return self._symbols_client
 
     def run(self, options: IngestOptions) -> IngestSummary:
         started = time.monotonic()
@@ -171,35 +180,26 @@ class DailyBarIngestJob:
         return summary
 
     def _resolve_targets(self, options: IngestOptions) -> list[IngestTarget]:
-        """Resolve symbol targets for ingestion."""
-        assert self._engine is not None
+        """Resolve symbol targets for ingestion via the symbols service."""
+        symbols = self._symbols()
         if options.tickers:
-            # Look up symbol_ids for the requested tickers
-            with self._engine.connect() as conn:
-                rows = conn.execute(
-                    text("""
-                        SELECT id, canonical_ticker FROM symbol_master.symbols
-                        WHERE canonical_ticker = ANY(:tickers)
-                    """),
-                    {"tickers": options.tickers},
-                ).fetchall()
-                found = {r[1] for r in rows}
-                targets = [IngestTarget(symbol_id=r[0], ticker=r[1]) for r in rows]
-                missing = set(options.tickers) - found
-                if missing:
-                    log.warning("tickers not found in symbol_master: %s", ", ".join(sorted(missing)))
-                return targets
-        else:
-            # All active symbols
-            with self._engine.connect() as conn:
-                rows = conn.execute(
-                    text("""
-                        SELECT id, canonical_ticker FROM symbol_master.symbols
-                        WHERE active = true
-                        ORDER BY canonical_ticker
-                    """)
-                ).fetchall()
-                return [IngestTarget(symbol_id=r[0], ticker=r[1]) for r in rows]
+            # Look up each requested ticker (active or delisted) in the symbols service.
+            targets: list[IngestTarget] = []
+            found: set[str] = set()
+            for ticker in options.tickers:
+                symbol = symbols.get_symbol_by_ticker(ticker)
+                if symbol is not None:
+                    targets.append(IngestTarget(symbol_id=symbol.symbol_id, ticker=symbol.ticker))
+                    found.add(ticker)
+            missing = set(options.tickers) - found
+            if missing:
+                log.warning("tickers not found in symbols service: %s", ", ".join(sorted(missing)))
+            return targets
+        # All active symbols
+        return [
+            IngestTarget(symbol_id=symbol.symbol_id, ticker=symbol.ticker)
+            for symbol in symbols.list_active_symbols()
+        ]
 
     def _create_run(self, options: IngestOptions, symbols_count: int) -> int:
         """Create a vendor_bar_runs record and return its id."""
@@ -207,11 +207,11 @@ class DailyBarIngestJob:
         with self._engine.begin() as conn:
             row = conn.execute(
                 text("""
-                    INSERT INTO market_data.vendor_bar_runs (
+                    INSERT INTO daily_bars.vendor_bar_runs (
                         vendor_source_id, mode, requested_start_date, requested_end_date,
                         symbols_requested, heartbeat_at
                     ) VALUES (
-                        (SELECT id FROM market_data.vendor_bar_sources WHERE vendor_name = 'polygon'),
+                        (SELECT id FROM daily_bars.vendor_bar_sources WHERE vendor_name = 'polygon'),
                         :mode, :start_date, :end_date, :symbols_count, now()
                     ) RETURNING id
                 """),
@@ -229,7 +229,7 @@ class DailyBarIngestJob:
         assert self._engine is not None
         with self._engine.begin() as conn:
             conn.execute(
-                text("UPDATE market_data.vendor_bar_runs SET heartbeat_at = now() WHERE id = :run_id"),
+                text("UPDATE daily_bars.vendor_bar_runs SET heartbeat_at = now() WHERE id = :run_id"),
                 {"run_id": run_id},
             )
 
@@ -252,7 +252,7 @@ class DailyBarIngestJob:
 
             with self._engine.begin() as conn:
                 vendor_source_id = conn.execute(
-                    text("SELECT id FROM market_data.vendor_bar_sources WHERE vendor_name = 'polygon'")
+                    text("SELECT id FROM daily_bars.vendor_bar_sources WHERE vendor_name = 'polygon'")
                 ).scalar_one()
 
                 for bar in page.results:
@@ -285,7 +285,7 @@ class DailyBarIngestJob:
         assert self._engine is not None
         with self._engine.begin() as conn:
             vendor_source_id = conn.execute(
-                text("SELECT id FROM market_data.vendor_bar_sources WHERE vendor_name = 'polygon'")
+                text("SELECT id FROM daily_bars.vendor_bar_sources WHERE vendor_name = 'polygon'")
             ).scalar_one()
             conn.execute(
                 UPSERT_MISSING_BAR,
@@ -305,7 +305,7 @@ class DailyBarIngestJob:
         with self._engine.begin() as conn:
             conn.execute(
                 text("""
-                    UPDATE market_data.vendor_bar_runs
+                    UPDATE daily_bars.vendor_bar_runs
                     SET status = :status,
                         symbols_succeeded = :succeeded,
                         symbols_failed = :failed,
@@ -364,20 +364,16 @@ class DailyBarIngestJob:
                 for bar in bars:
                     print(f"  {bar.ticker}  {bar.bar_date}  O={bar.open} H={bar.high} L={bar.low} C={bar.close} V={bar.volume}")
             elif self._engine is not None:
+                symbol = self._symbols().get_symbol_by_ticker(ticker)
+                if symbol is None:
+                    log.warning("ticker %s not in symbols service, skipping DB write", ticker)
+                    summary.symbols_failed += 1
+                    continue
+                symbol_id = symbol.symbol_id
                 run_id = self._create_run(options, 1)
-                # Resolve or synthesize symbol_id
                 with self._engine.begin() as conn:
-                    row = conn.execute(
-                        text("SELECT id FROM symbol_master.symbols WHERE canonical_ticker = :ticker"),
-                        {"ticker": ticker},
-                    ).fetchone()
-                    if row is None:
-                        log.warning("ticker %s not in symbol_master, skipping DB write", ticker)
-                        summary.symbols_failed += 1
-                        continue
-                    symbol_id = row[0]
                     vendor_source_id = conn.execute(
-                        text("SELECT id FROM market_data.vendor_bar_sources WHERE vendor_name = 'polygon'")
+                        text("SELECT id FROM daily_bars.vendor_bar_sources WHERE vendor_name = 'polygon'")
                     ).scalar_one()
 
                     for bar in bars:
@@ -424,8 +420,8 @@ class DailyBarIngestJob:
                            r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
                            r.bars_upserted, r.errors, r.duration_seconds,
                            r.started_at, r.finished_at
-                    FROM market_data.vendor_bar_runs r
-                    JOIN market_data.vendor_bar_sources s ON s.id = r.vendor_source_id
+                    FROM daily_bars.vendor_bar_runs r
+                    JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
                     ORDER BY r.id DESC
                     LIMIT 1
                 """)

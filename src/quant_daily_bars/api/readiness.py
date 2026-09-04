@@ -74,14 +74,14 @@ def check_database_readiness(database_url: str | None = None) -> ReadinessStatus
         with engine.connect() as connection:
             connection.execute(text("SELECT 1")).scalar_one()
             schema_version = connection.execute(
-                text("SELECT version_num FROM market_data.alembic_version_daily_bars")
+                text("SELECT version_num FROM daily_bars.alembic_version_daily_bars")
             ).scalar_one()
             tables = tuple(
                 connection.execute(
                     text("""
                         SELECT table_name
                         FROM information_schema.tables
-                        WHERE table_schema = 'market_data'
+                        WHERE table_schema = 'daily_bars'
                           AND table_type = 'BASE TABLE'
                           AND table_name != 'alembic_version_daily_bars'
                         ORDER BY table_name
@@ -97,8 +97,8 @@ def check_database_readiness(database_url: str | None = None) -> ReadinessStatus
                            r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
                            r.bars_upserted, r.errors, r.duration_seconds,
                            r.started_at, r.finished_at
-                    FROM market_data.vendor_bar_runs r
-                    JOIN market_data.vendor_bar_sources s ON s.id = r.vendor_source_id
+                    FROM daily_bars.vendor_bar_runs r
+                    JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
                     ORDER BY r.id DESC
                     LIMIT 1
                 """)

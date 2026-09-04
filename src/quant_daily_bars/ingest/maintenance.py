@@ -9,7 +9,7 @@ DEFAULT_STALE_AFTER_MINUTES = 30
 STALE_REASON = "cancelled by stale-run sweep: no heartbeat"
 
 _CANCEL_STALE_RUNS = text("""
-    UPDATE market_data.vendor_bar_runs
+    UPDATE daily_bars.vendor_bar_runs
     SET status = 'cancelled',
         finished_at = now(),
         duration_seconds = COALESCE(

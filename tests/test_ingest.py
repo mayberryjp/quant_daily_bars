@@ -53,3 +53,49 @@ class TestIdempotentDesign:
         from quant_daily_bars.ingest.job import UPSERT_MISSING_BAR
         sql_text = str(UPSERT_MISSING_BAR.text)
         assert "ON CONFLICT" in sql_text
+
+
+class _FakeSymbols:
+    """Stand-in for SymbolsApiClient used to resolve ingest targets."""
+
+    def __init__(self, symbols):
+        self._symbols = symbols
+
+    def list_active_symbols(self):
+        return [s for s in self._symbols if s.active]
+
+    def get_symbol_by_ticker(self, ticker, active=None):
+        for symbol in self._symbols:
+            if symbol.ticker == ticker:
+                return symbol
+        return None
+
+
+class TestResolveTargets:
+    """Target resolution goes through the symbols service, not a DB join."""
+
+    def _job(self):
+        from quant_daily_bars.symbols.client import Symbol
+
+        symbols = [
+            Symbol(symbol_id=1, ticker="AAPL", active=True),
+            Symbol(symbol_id=2, ticker="MSFT", active=True),
+            Symbol(symbol_id=3, ticker="OLDCO", active=False),
+        ]
+        return DailyBarIngestJob(symbols_client=_FakeSymbols(symbols))
+
+    def test_all_active_symbols(self):
+        job = self._job()
+        options = IngestOptions(from_date=date(2024, 1, 1), to_date=date(2024, 1, 5))
+        targets = job._resolve_targets(options)
+        assert sorted(t.symbol_id for t in targets) == [1, 2]
+
+    def test_explicit_tickers_skip_unknown(self):
+        job = self._job()
+        options = IngestOptions(
+            from_date=date(2024, 1, 1),
+            to_date=date(2024, 1, 5),
+            tickers=["MSFT", "NOPE"],
+        )
+        targets = job._resolve_targets(options)
+        assert [(t.symbol_id, t.ticker) for t in targets] == [(2, "MSFT")]

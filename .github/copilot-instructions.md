@@ -26,7 +26,7 @@ No linter is configured in the project.
 
 ## Architecture
 
-This is a **daily OHLCV bar ingestion service** in the `quant` momentum pipeline. It pulls market data from Polygon.io and upserts it into a PostgreSQL `market_data` schema.
+This is a **daily OHLCV bar ingestion service** in the `quant` momentum pipeline. It pulls market data from Polygon.io and upserts it into a PostgreSQL `daily_bars` schema.
 
 ### Layered design
 
@@ -43,7 +43,7 @@ CLI (_cli_impl.py)
 
 ### Cross-service dependency
 
-`daily_bars.symbol_id` references `symbol_master.symbols.id` from the **quant_symbols** service. When DBs are separate, this FK is enforced at the application level only.
+The `daily_bars` table's `symbol_id` column is a logical reference to a symbol owned by the **quant_symbols** service. Symbols are resolved over the quant_symbols HTTP API (`SYMBOLS_API_URL`, client in `symbols/client.py`), not by joining across schemas; the reference is enforced at the application level only.
 
 ## Key Conventions
 
@@ -54,5 +54,5 @@ CLI (_cli_impl.py)
 - **Environment configuration**: all secrets/settings come from env vars (see `.env.example`). The API key env var is `MASSIVE_API_KEY`.
 - **Idempotent upserts**: the unique constraint is `(symbol_id, bar_date, adjustment_type)`. Re-running the same window overwrites with latest data.
 - **Error isolation**: one symbol's failure does not abort the run. Failures are counted and reported in the summary.
-- **Alembic migrations** live in `alembic/versions/`. The schema is `market_data` with a custom version table `market_data.alembic_version_daily_bars`.
+- **Alembic migrations** live in `alembic/versions/`. The schema is `daily_bars` with a custom version table `daily_bars.alembic_version_daily_bars`. Migration `0004` renamed this service's schema from the legacy `market_data` schema to `daily_bars` (moving existing tables and the version table, then dropping the old schema).
 - **No ORM models**: SQL is written as raw `text()` statements via SQLAlchemy Core, not mapped ORM classes.
