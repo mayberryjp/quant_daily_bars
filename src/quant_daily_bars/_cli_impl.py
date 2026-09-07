@@ -43,10 +43,10 @@ def _alembic_config() -> object:
 
 def _engine() -> object:
     try:
-        from quant_daily_bars.localtime import make_engine
+        from sqlalchemy import create_engine
     except ModuleNotFoundError as exc:
         raise SystemExit("SQLAlchemy is required for database commands") from exc
-    return make_engine(_database_url(), pool_pre_ping=True, pool_size=20, max_overflow=20)
+    return create_engine(_database_url(), pool_pre_ping=True, pool_size=20, max_overflow=20)
 
 
 # ── db commands ─────────────────────────────────────────────────────────────
