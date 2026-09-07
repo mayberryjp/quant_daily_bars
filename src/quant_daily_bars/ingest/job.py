@@ -12,13 +12,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from quant_daily_bars.ingest.summary import IngestSummary
+from quant_daily_bars.localtime import local_now
 from quant_daily_bars.symbols.client import SymbolsApiClient
 from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
 from quant_daily_bars.vendors.polygon.errors import PolygonError
@@ -393,7 +394,7 @@ class DailyBarIngestJob:
                                 "transactions": bar.transactions,
                                 "vendor_source_id": vendor_source_id,
                                 "vendor_bar_run_id": run_id,
-                                "fetched_at": datetime.now(timezone.utc),
+                                "fetched_at": local_now(),
                             },
                         )
                         summary.bars_upserted += 1

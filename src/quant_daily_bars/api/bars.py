@@ -27,11 +27,11 @@ class IngestRunListParams:
 
 
 def _engine():
-    from sqlalchemy import create_engine
+    from quant_daily_bars.localtime import make_engine
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is not configured")
-    return create_engine(database_url, pool_pre_ping=True, pool_size=20, max_overflow=20)
+    return make_engine(database_url, pool_pre_ping=True, pool_size=20, max_overflow=20)
 
 
 def list_bars(params: BarListParams) -> dict[str, Any]:

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Dict
 
+from quant_daily_bars.localtime import local_now
 from quant_daily_bars.vendors.polygon.errors import PolygonMalformedPayloadError
 
 
@@ -68,7 +69,7 @@ class AggregatesPage:
     status: str | None = None
     adjusted: bool = False
     next_url: str | None = None
-    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    fetched_at: datetime = field(default_factory=local_now)
 
     @classmethod
     def from_payload(
@@ -101,7 +102,7 @@ class AggregatesPage:
             status=_optional_str(payload, "status"),
             adjusted=payload.get("adjusted", False),
             next_url=_optional_str(payload, "next_url"),
-            fetched_at=fetched_at or datetime.now(timezone.utc),
+            fetched_at=fetched_at or local_now(),
         )
 
 

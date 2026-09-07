@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
+from quant_daily_bars.localtime import local_now
 from quant_daily_bars.vendors.polygon.config import PolygonConfig
 from quant_daily_bars.vendors.polygon.errors import (
     PolygonAuthError,
@@ -92,7 +93,7 @@ class PolygonBarsClient:
         url = self._with_api_key(self._build_url(path, params))
         log.info("requesting daily bars  ticker=%s  from=%s  to=%s", ticker, from_date, to_date)
         payload = self._request_json(url)
-        fetched_at = datetime.now(timezone.utc)
+        fetched_at = local_now()
         return AggregatesPage.from_payload(payload, ticker=ticker, fetched_at=fetched_at)
 
     def iter_daily_bars(
@@ -118,7 +119,7 @@ class PolygonBarsClient:
             request_url = self._with_api_key(next_url)
             log.info("requesting page %d  url=%s", pages_seen + 1, self._redact_api_key(request_url))
             payload = self._request_json(request_url)
-            fetched_at = datetime.now(timezone.utc)
+            fetched_at = local_now()
             page = AggregatesPage.from_payload(payload, ticker=ticker, fetched_at=fetched_at)
             yield page
             pages_seen += 1

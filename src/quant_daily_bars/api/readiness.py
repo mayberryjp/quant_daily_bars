@@ -64,11 +64,13 @@ def sanitize_readiness_error(error: BaseException, database_url: str | None = No
 
 
 def check_database_readiness(database_url: str | None = None) -> ReadinessStatus:
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+
+    from quant_daily_bars.localtime import make_engine
 
     resolved_url = database_url or _database_url_from_env()
     expected_table_names = tuple(sorted(EXPECTED_TABLES))
-    engine = create_engine(resolved_url, pool_pre_ping=True)
+    engine = make_engine(resolved_url, pool_pre_ping=True)
 
     try:
         with engine.connect() as connection:

@@ -84,6 +84,9 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        from quant_daily_bars.localtime import local_timezone_name
+
+        connection.execute(text(f"SET TIME ZONE '{local_timezone_name()}'"))
         _relocate_version_table(connection)
         context.configure(
             connection=connection,
