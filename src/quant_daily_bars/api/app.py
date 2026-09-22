@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import time
 from typing import Any, Callable, Dict, Optional, Union
 
 from bottle import Bottle, request, response
@@ -156,26 +155,6 @@ def create_app(
 ) -> Bottle:
     api = Bottle()
     api.title = SERVICE_NAME
-
-    # -- request logging hooks ------------------------------------------
-
-    @api.hook("before_request")
-    def _log_before() -> None:
-        request._log_start = time.perf_counter()  # type: ignore[attr-defined]
-        log.info(
-            "request_start method=%s path=%s query=%s",
-            request.method, request.path, request.query_string,
-        )
-
-    @api.hook("after_request")
-    def _log_after() -> None:
-        start = getattr(request, "_log_start", None)
-        if start is not None:
-            duration_ms = (time.perf_counter() - start) * 1000
-            log.info(
-                "request_end method=%s path=%s status=%d duration_ms=%.1f",
-                request.method, request.path, response.status_code, duration_ms,
-            )
 
     # -- CORS: allow any origin -------------------------------------------
 
