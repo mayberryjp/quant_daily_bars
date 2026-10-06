@@ -143,20 +143,17 @@ def _run_ingest_job(params: IngestTriggerParams) -> tuple[int | None, dict[str, 
     from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
 
     engine = _engine()
-    try:
-        client = PolygonBarsClient.from_env()
-        options = IngestOptions(
-            from_date=params.from_date,
-            to_date=params.to_date,
-            tickers=params.tickers,
-            adjustment_type=params.adjustment_type,
-            mode=params.mode,
-        )
-        job = DailyBarIngestJob(engine=engine, client=client)
-        summary = job.run(options)
-        return summary.run_id, _summary_to_dict(summary)
-    finally:
-        engine.dispose()
+    client = PolygonBarsClient.from_env()
+    options = IngestOptions(
+        from_date=params.from_date,
+        to_date=params.to_date,
+        tickers=params.tickers,
+        adjustment_type=params.adjustment_type,
+        mode=params.mode,
+    )
+    job = DailyBarIngestJob(engine=engine, client=client)
+    summary = job.run(options)
+    return summary.run_id, _summary_to_dict(summary)
 
 
 class IngestJobManager:

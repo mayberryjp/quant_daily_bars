@@ -46,7 +46,23 @@ def _engine() -> object:
         from sqlalchemy import create_engine
     except ModuleNotFoundError as exc:
         raise SystemExit("SQLAlchemy is required for database commands") from exc
-    return create_engine(_database_url(), pool_pre_ping=True, pool_size=20, max_overflow=20)
+    # Size the pool to the fetch-worker count (plus headroom for the orchestrator's own
+    # bookkeeping connections) and keep idle sockets alive, so checkouts reuse warm
+    # connections instead of reconnecting — each reconnect re-resolves the DB host via DNS.
+    workers = int(os.environ.get("INGEST_FETCH_WORKERS", "25"))
+    return create_engine(
+        _database_url(),
+        pool_pre_ping=True,
+        pool_size=workers + 5,
+        max_overflow=10,
+        pool_recycle=1800,
+        connect_args={
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        },
+    )
 
 
 # ── db commands ─────────────────────────────────────────────────────────────
@@ -299,47 +315,56 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
             time.sleep(interval)
             continue
 
-        total_gaps_filled = 0
-        total_symbols_with_gaps = 0
-        total_symbols_skipped = 0
-
-        for symbol in symbols:
-            sym_id, ticker = symbol.symbol_id, symbol.ticker
-            # Check if already backfilled for this range
-            with engine.connect() as conn:
-                status_row = conn.execute(
+        # Load existing backfill status for every symbol in one query, then decide
+        # which still have gaps — instead of a round trip per symbol.
+        with engine.connect() as conn:
+            status_by_id = {
+                row["symbol_id"]: row
+                for row in conn.execute(
                     sa_text("""
-                        SELECT query_start_date, query_end_date, bars_returned
+                        SELECT symbol_id, query_start_date, query_end_date
                         FROM daily_bars.symbol_backfill_status
-                        WHERE symbol_id = :symbol_id
-                    """),
-                    {"symbol_id": sym_id},
-                ).mappings().first()
+                    """)
+                ).mappings()
+            }
 
-            if status_row is not None:
-                # Already queried — skip if the tracked range covers our range
-                if status_row["query_start_date"] <= gap_start and status_row["query_end_date"] >= yesterday:
-                    total_symbols_skipped += 1
-                    continue
+        gap_symbols = []
+        total_symbols_skipped = 0
+        for symbol in symbols:
+            status_row = status_by_id.get(symbol.symbol_id)
+            if (
+                status_row is not None
+                and status_row["query_start_date"] <= gap_start
+                and status_row["query_end_date"] >= yesterday
+            ):
+                total_symbols_skipped += 1
+                continue
+            gap_symbols.append(symbol)
 
-            total_symbols_with_gaps += 1
-            log.info("%s: fetching %s to %s", ticker, gap_start, yesterday)
+        total_symbols_with_gaps = len(gap_symbols)
+        total_gaps_filled = 0
 
-            # Single API call for the entire range
+        if gap_symbols:
+            log.info(
+                "filling gaps for %d symbols from %s to %s",
+                len(gap_symbols), gap_start, yesterday,
+            )
+            # One run for the whole batch: a single vendor_bar_runs row, pooled
+            # connections reused across upserts, and the symbols client/session shared.
             options = IngestOptions(
                 from_date=gap_start,
                 to_date=yesterday,
-                tickers=[ticker],
+                tickers=[s.ticker for s in gap_symbols],
                 adjustment_type="unadjusted",
                 mode="backfill",
             )
-            job = DailyBarIngestJob(engine=engine, client=client)
+            job = DailyBarIngestJob(engine=engine, client=client, symbols_client=symbols_client)
             try:
                 summary = job.run(options)
-                total_gaps_filled += summary.bars_upserted
+                total_gaps_filled = summary.bars_upserted
 
-                # Record backfill status
-                with engine.connect() as conn:
+                # Record backfill status for every attempted symbol in one transaction.
+                with engine.begin() as conn:
                     conn.execute(
                         sa_text("""
                             INSERT INTO daily_bars.symbol_backfill_status
@@ -351,24 +376,23 @@ def bars_backfill_gaps(args: argparse.Namespace) -> None:
                                 bars_returned = :bars,
                                 last_queried_at = now()
                         """),
-                        {
-                            "symbol_id": sym_id,
-                            "ticker": ticker,
-                            "start": gap_start,
-                            "end": yesterday,
-                            "bars": summary.bars_upserted,
-                        },
+                        [
+                            {
+                                "symbol_id": s.symbol_id,
+                                "ticker": s.ticker,
+                                "start": gap_start,
+                                "end": yesterday,
+                                "bars": summary.bars_by_ticker.get(s.ticker, 0),
+                            }
+                            for s in gap_symbols
+                        ],
                     )
-                    conn.commit()
-
-                log.info("%s: upserted %d bars", ticker, summary.bars_upserted)
             except (PolygonAuthError, PolygonRateLimitError) as exc:
-                log.error("%s: API error filling gaps: %s", ticker, exc)
+                log.error("API error filling gaps: %s", exc)
                 if run_once:
                     raise SystemExit(1) from exc
-                break  # stop processing, try next cycle
             except Exception as exc:
-                log.error("%s: error filling gaps: %s", ticker, exc)
+                log.error("error filling gaps: %s", exc)
 
         print(
             f"backfill_gaps  symbols_with_gaps={total_symbols_with_gaps}  "

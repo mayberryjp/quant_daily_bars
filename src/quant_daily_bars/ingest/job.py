@@ -29,6 +29,8 @@ from quant_daily_bars.vendors.polygon.models import AggregateBar
 log = logging.getLogger(__name__)
 
 _DEFAULT_FETCH_WORKERS = 25
+# How often to refresh a run's heartbeat while symbols complete (seconds).
+_HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,7 @@ class DailyBarIngestJob:
         self._engine = engine
         self._client = client
         self._symbols_client = symbols_client
+        self._vendor_source_id_cache: int | None = None
         if fetch_workers is None:
             fetch_workers = int(os.environ.get("INGEST_FETCH_WORKERS", str(_DEFAULT_FETCH_WORKERS)))
         self._fetch_workers = max(1, fetch_workers)
@@ -136,6 +139,9 @@ class DailyBarIngestJob:
 
         run_id = self._create_run(options, len(targets))
         summary.run_id = run_id
+        # Resolve the vendor source id once on this thread so worker upserts reuse it
+        # instead of re-querying it inside every transaction.
+        vendor_source_id = self._vendor_source_id()
 
         # Symbols are independent, so fetch/upsert them concurrently. The shared
         # cross-process rate limiter (see PolygonBarsClient) still caps the
@@ -143,10 +149,11 @@ class DailyBarIngestJob:
         # saturated instead of leaving it idle between sequential requests.
         summary_lock = threading.Lock()
         worker_count = min(self._fetch_workers, len(targets))
+        last_heartbeat = time.monotonic()
 
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="bar-fetch") as executor:
             future_to_target = {
-                executor.submit(self._ingest_symbol, target, options, run_id): target
+                executor.submit(self._ingest_symbol, target, options, run_id, vendor_source_id): target
                 for target in targets
             }
             for future in as_completed(future_to_target):
@@ -155,12 +162,13 @@ class DailyBarIngestJob:
                     bars_count = future.result()
                     with summary_lock:
                         summary.bars_upserted += bars_count
+                        summary.bars_by_ticker[target.ticker] = bars_count
                         summary.symbols_succeeded += 1
                         if bars_count == 0:
                             summary.missing_bars_recorded += 1
                             summary.warnings.append(f"{target.ticker}: no bars returned")
                     if bars_count == 0:
-                        self._record_missing(target, options, run_id, "no bars returned by vendor")
+                        self._record_missing(target, options, run_id, vendor_source_id, "no bars returned by vendor")
                 except PolygonError as exc:
                     with summary_lock:
                         summary.symbols_failed += 1
@@ -173,7 +181,10 @@ class DailyBarIngestJob:
                         summary.errors += 1
                         summary.failures.append(f"{target.ticker}: {exc}")
                     log.error("unexpected error ingesting %s: %s", target.ticker, exc, exc_info=True)
-                self._heartbeat(run_id)
+                now = time.monotonic()
+                if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
+                    self._heartbeat(run_id)
+                    last_heartbeat = now
 
         summary.status = "failed" if summary.errors > 0 and summary.symbols_succeeded == 0 else "ok"
         summary.duration_seconds = time.monotonic() - started
@@ -234,7 +245,17 @@ class DailyBarIngestJob:
                 {"run_id": run_id},
             )
 
-    def _ingest_symbol(self, target: IngestTarget, options: IngestOptions, run_id: int) -> int:
+    def _vendor_source_id(self) -> int:
+        """Return the polygon vendor source id, resolving and caching it once per job."""
+        if self._vendor_source_id_cache is None:
+            assert self._engine is not None
+            with self._engine.begin() as conn:
+                self._vendor_source_id_cache = conn.execute(
+                    text("SELECT id FROM daily_bars.vendor_bar_sources WHERE vendor_name = 'polygon'")
+                ).scalar_one()
+        return self._vendor_source_id_cache
+
+    def _ingest_symbol(self, target: IngestTarget, options: IngestOptions, run_id: int, vendor_source_id: int) -> int:
         """Fetch and upsert daily bars for one symbol. Returns count of bars upserted."""
         assert self._client is not None
         assert self._engine is not None
@@ -252,10 +273,6 @@ class DailyBarIngestJob:
                 continue
 
             with self._engine.begin() as conn:
-                vendor_source_id = conn.execute(
-                    text("SELECT id FROM daily_bars.vendor_bar_sources WHERE vendor_name = 'polygon'")
-                ).scalar_one()
-
                 for bar in page.results:
                     conn.execute(
                         UPSERT_DAILY_BAR,
@@ -281,13 +298,10 @@ class DailyBarIngestJob:
         log.info("ingested %d bars for %s", bars_upserted, target.ticker)
         return bars_upserted
 
-    def _record_missing(self, target: IngestTarget, options: IngestOptions, run_id: int, reason: str) -> None:
+    def _record_missing(self, target: IngestTarget, options: IngestOptions, run_id: int, vendor_source_id: int, reason: str) -> None:
         """Record a missing bar entry for operator inspection."""
         assert self._engine is not None
         with self._engine.begin() as conn:
-            vendor_source_id = conn.execute(
-                text("SELECT id FROM daily_bars.vendor_bar_sources WHERE vendor_name = 'polygon'")
-            ).scalar_one()
             conn.execute(
                 UPSERT_MISSING_BAR,
                 {
@@ -372,11 +386,8 @@ class DailyBarIngestJob:
                     continue
                 symbol_id = symbol.symbol_id
                 run_id = self._create_run(options, 1)
+                vendor_source_id = self._vendor_source_id()
                 with self._engine.begin() as conn:
-                    vendor_source_id = conn.execute(
-                        text("SELECT id FROM daily_bars.vendor_bar_sources WHERE vendor_name = 'polygon'")
-                    ).scalar_one()
-
                     for bar in bars:
                         conn.execute(
                             UPSERT_DAILY_BAR,

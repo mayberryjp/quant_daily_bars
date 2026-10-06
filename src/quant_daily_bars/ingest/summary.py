@@ -22,6 +22,7 @@ class IngestSummary:
     run_id: int | None = None
     warnings: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    bars_by_ticker: dict[str, int] = field(default_factory=dict)
 
     def format_line(self) -> str:
         parts = [

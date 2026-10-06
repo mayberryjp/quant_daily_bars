@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,56 +27,78 @@ class IngestRunListParams:
     offset: int = 0
 
 
+_ENGINE = None
+_ENGINE_LOCK = threading.Lock()
+
+
 def _engine():
-    from sqlalchemy import create_engine
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        raise RuntimeError("DATABASE_URL is not configured")
-    return create_engine(database_url, pool_pre_ping=True, pool_size=20, max_overflow=20)
+    # Cache one process-wide engine so requests reuse the pool instead of opening
+    # (and DNS-resolving) a fresh connection each call. Keepalives + pool_recycle
+    # keep idle sockets warm so pool_pre_ping doesn't reconnect between requests.
+    global _ENGINE
+    if _ENGINE is None:
+        from sqlalchemy import create_engine
+
+        with _ENGINE_LOCK:
+            if _ENGINE is None:
+                database_url = os.environ.get("DATABASE_URL")
+                if not database_url:
+                    raise RuntimeError("DATABASE_URL is not configured")
+                _ENGINE = create_engine(
+                    database_url,
+                    pool_pre_ping=True,
+                    pool_size=20,
+                    max_overflow=20,
+                    pool_recycle=1800,
+                    connect_args={
+                        "keepalives": 1,
+                        "keepalives_idle": 30,
+                        "keepalives_interval": 10,
+                        "keepalives_count": 5,
+                    },
+                )
+    return _ENGINE
 
 
 def list_bars(params: BarListParams) -> dict[str, Any]:
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            where_parts = []
-            values: dict[str, Any] = {"limit": params.limit, "offset": params.offset}
+    with engine.connect() as conn:
+        where_parts = []
+        values: dict[str, Any] = {"limit": params.limit, "offset": params.offset}
 
-            if params.ticker is not None:
-                where_parts.append("d.ticker = :ticker")
-                values["ticker"] = params.ticker
-            if params.symbol_id is not None:
-                where_parts.append("d.symbol_id = :symbol_id")
-                values["symbol_id"] = params.symbol_id
-            if params.from_date is not None:
-                where_parts.append("d.bar_date >= :from_date")
-                values["from_date"] = params.from_date
-            if params.to_date is not None:
-                where_parts.append("d.bar_date <= :to_date")
-                values["to_date"] = params.to_date
-            if params.adjustment_type is not None:
-                where_parts.append("d.adjustment_type = :adjustment_type")
-                values["adjustment_type"] = params.adjustment_type
+        if params.ticker is not None:
+            where_parts.append("d.ticker = :ticker")
+            values["ticker"] = params.ticker
+        if params.symbol_id is not None:
+            where_parts.append("d.symbol_id = :symbol_id")
+            values["symbol_id"] = params.symbol_id
+        if params.from_date is not None:
+            where_parts.append("d.bar_date >= :from_date")
+            values["from_date"] = params.from_date
+        if params.to_date is not None:
+            where_parts.append("d.bar_date <= :to_date")
+            values["to_date"] = params.to_date
+        if params.adjustment_type is not None:
+            where_parts.append("d.adjustment_type = :adjustment_type")
+            values["adjustment_type"] = params.adjustment_type
 
-            where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-            rows = conn.execute(
-                text(f"""
-                    SELECT d.id, d.symbol_id, d.ticker, d.bar_date,
-                           d.adjustment_type, d.open, d.high, d.low, d.close,
-                           d.volume, d.vwap, d.transactions,
-                           d.fetched_at, d.vendor_bar_run_id
-                    FROM daily_bars.daily_bars d
-                    {where_clause}
-                    ORDER BY d.bar_date DESC, d.ticker ASC
-                    LIMIT :limit OFFSET :offset
-                """),
-                values,
-            ).mappings().all()
-    finally:
-        engine.dispose()
+        rows = conn.execute(
+            text(f"""
+                SELECT d.id, d.symbol_id, d.ticker, d.bar_date,
+                       d.adjustment_type, d.open, d.high, d.low, d.close,
+                       d.volume, d.vwap, d.transactions,
+                       d.fetched_at, d.vendor_bar_run_id
+                FROM daily_bars.daily_bars d
+                {where_clause}
+                ORDER BY d.bar_date DESC, d.ticker ASC
+                LIMIT :limit OFFSET :offset
+            """),
+            values,
+        ).mappings().all()
 
     items = [_bar_to_item(row) for row in rows]
     return {
@@ -90,23 +113,20 @@ def get_bar_summary(ticker: str) -> dict[str, Any] | None:
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT d.ticker, d.symbol_id,
-                           MIN(d.bar_date) AS first_date,
-                           MAX(d.bar_date) AS last_date,
-                           COUNT(*) AS bar_count,
-                           d.adjustment_type
-                    FROM daily_bars.daily_bars d
-                    WHERE d.ticker = :ticker
-                    GROUP BY d.ticker, d.symbol_id, d.adjustment_type
-                """),
-                {"ticker": ticker},
-            ).mappings().first()
-    finally:
-        engine.dispose()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT d.ticker, d.symbol_id,
+                       MIN(d.bar_date) AS first_date,
+                       MAX(d.bar_date) AS last_date,
+                       COUNT(*) AS bar_count,
+                       d.adjustment_type
+                FROM daily_bars.daily_bars d
+                WHERE d.ticker = :ticker
+                GROUP BY d.ticker, d.symbol_id, d.adjustment_type
+            """),
+            {"ticker": ticker},
+        ).mappings().first()
 
     if row is None:
         return None
@@ -125,21 +145,18 @@ def list_tickers_coverage() -> dict[str, Any]:
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("""
-                    SELECT d.ticker, d.symbol_id,
-                           MIN(d.bar_date) AS first_date,
-                           MAX(d.bar_date) AS last_date,
-                           COUNT(*) AS bar_count
-                    FROM daily_bars.daily_bars d
-                    GROUP BY d.ticker, d.symbol_id
-                    ORDER BY d.ticker
-                """)
-            ).mappings().all()
-    finally:
-        engine.dispose()
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT d.ticker, d.symbol_id,
+                       MIN(d.bar_date) AS first_date,
+                       MAX(d.bar_date) AS last_date,
+                       COUNT(*) AS bar_count
+                FROM daily_bars.daily_bars d
+                GROUP BY d.ticker, d.symbol_id
+                ORDER BY d.ticker
+            """)
+        ).mappings().all()
 
     items = [
         {
@@ -158,37 +175,34 @@ def list_ingest_runs(params: IngestRunListParams) -> dict[str, Any]:
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            where_parts = []
-            values: dict[str, Any] = {"limit": params.limit, "offset": params.offset}
+    with engine.connect() as conn:
+        where_parts = []
+        values: dict[str, Any] = {"limit": params.limit, "offset": params.offset}
 
-            if params.status is not None:
-                where_parts.append("r.status = :status")
-                values["status"] = params.status
-            if params.mode is not None:
-                where_parts.append("r.mode = :mode")
-                values["mode"] = params.mode
+        if params.status is not None:
+            where_parts.append("r.status = :status")
+            values["status"] = params.status
+        if params.mode is not None:
+            where_parts.append("r.mode = :mode")
+            values["mode"] = params.mode
 
-            where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-            rows = conn.execute(
-                text(f"""
-                    SELECT r.id, s.vendor_name, r.mode, r.status,
-                           r.requested_start_date, r.requested_end_date,
-                           r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
-                           r.bars_upserted, r.errors, r.error_message,
-                           r.duration_seconds, r.started_at, r.finished_at
-                    FROM daily_bars.vendor_bar_runs r
-                    JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
-                    {where_clause}
-                    ORDER BY r.id DESC
-                    LIMIT :limit OFFSET :offset
-                """),
-                values,
-            ).mappings().all()
-    finally:
-        engine.dispose()
+        rows = conn.execute(
+            text(f"""
+                SELECT r.id, s.vendor_name, r.mode, r.status,
+                       r.requested_start_date, r.requested_end_date,
+                       r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
+                       r.bars_upserted, r.errors, r.error_message,
+                       r.duration_seconds, r.started_at, r.finished_at
+                FROM daily_bars.vendor_bar_runs r
+                JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
+                {where_clause}
+                ORDER BY r.id DESC
+                LIMIT :limit OFFSET :offset
+            """),
+            values,
+        ).mappings().all()
 
     items = [_run_to_item(row) for row in rows]
     return {
@@ -203,23 +217,20 @@ def get_ingest_run(run_id: int) -> dict[str, Any] | None:
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT r.id, s.vendor_name, r.mode, r.status,
-                           r.requested_start_date, r.requested_end_date,
-                           r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
-                           r.bars_upserted, r.errors, r.error_message,
-                           r.duration_seconds, r.started_at, r.finished_at
-                    FROM daily_bars.vendor_bar_runs r
-                    JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
-                    WHERE r.id = :run_id
-                """),
-                {"run_id": run_id},
-            ).mappings().first()
-    finally:
-        engine.dispose()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT r.id, s.vendor_name, r.mode, r.status,
+                       r.requested_start_date, r.requested_end_date,
+                       r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
+                       r.bars_upserted, r.errors, r.error_message,
+                       r.duration_seconds, r.started_at, r.finished_at
+                FROM daily_bars.vendor_bar_runs r
+                JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
+                WHERE r.id = :run_id
+            """),
+            {"run_id": run_id},
+        ).mappings().first()
 
     if row is None:
         return None
@@ -230,23 +241,20 @@ def get_latest_ingest_run() -> dict[str, Any] | None:
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT r.id, s.vendor_name, r.mode, r.status,
-                           r.requested_start_date, r.requested_end_date,
-                           r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
-                           r.bars_upserted, r.errors, r.error_message,
-                           r.duration_seconds, r.started_at, r.finished_at
-                    FROM daily_bars.vendor_bar_runs r
-                    JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
-                    ORDER BY r.id DESC
-                    LIMIT 1
-                """),
-            ).mappings().first()
-    finally:
-        engine.dispose()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT r.id, s.vendor_name, r.mode, r.status,
+                       r.requested_start_date, r.requested_end_date,
+                       r.symbols_requested, r.symbols_succeeded, r.symbols_failed,
+                       r.bars_upserted, r.errors, r.error_message,
+                       r.duration_seconds, r.started_at, r.finished_at
+                FROM daily_bars.vendor_bar_runs r
+                JOIN daily_bars.vendor_bar_sources s ON s.id = r.vendor_source_id
+                ORDER BY r.id DESC
+                LIMIT 1
+            """),
+        ).mappings().first()
 
     if row is None:
         return None
@@ -257,27 +265,24 @@ def get_missing_bars(ticker: str | None = None, limit: int = 100, offset: int = 
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            values: dict[str, Any] = {"limit": limit, "offset": offset}
-            where_clause = ""
-            if ticker is not None:
-                where_clause = "WHERE m.ticker = :ticker"
-                values["ticker"] = ticker
+    with engine.connect() as conn:
+        values: dict[str, Any] = {"limit": limit, "offset": offset}
+        where_clause = ""
+        if ticker is not None:
+            where_clause = "WHERE m.ticker = :ticker"
+            values["ticker"] = ticker
 
-            rows = conn.execute(
-                text(f"""
-                    SELECT m.id, m.symbol_id, m.ticker, m.bar_date,
-                           m.reason, m.vendor_bar_run_id, m.created_at
-                    FROM daily_bars.missing_bars m
-                    {where_clause}
-                    ORDER BY m.bar_date DESC, m.ticker ASC
-                    LIMIT :limit OFFSET :offset
-                """),
-                values,
-            ).mappings().all()
-    finally:
-        engine.dispose()
+        rows = conn.execute(
+            text(f"""
+                SELECT m.id, m.symbol_id, m.ticker, m.bar_date,
+                       m.reason, m.vendor_bar_run_id, m.created_at
+                FROM daily_bars.missing_bars m
+                {where_clause}
+                ORDER BY m.bar_date DESC, m.ticker ASC
+                LIMIT :limit OFFSET :offset
+            """),
+            values,
+        ).mappings().all()
 
     items = [
         {
@@ -298,19 +303,16 @@ def get_bar_date_range() -> dict[str, Any] | None:
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT MIN(bar_date) AS first_date,
-                           MAX(bar_date) AS last_date,
-                           COUNT(*) AS total_bars,
-                           COUNT(DISTINCT bar_date) AS unique_days
-                    FROM daily_bars.daily_bars
-                """)
-            ).mappings().first()
-    finally:
-        engine.dispose()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT MIN(bar_date) AS first_date,
+                       MAX(bar_date) AS last_date,
+                       COUNT(*) AS total_bars,
+                       COUNT(DISTINCT bar_date) AS unique_days
+                FROM daily_bars.daily_bars
+            """)
+        ).mappings().first()
 
     if row is None or row["first_date"] is None:
         return None
@@ -341,59 +343,56 @@ def get_backfill_progress(from_date: str = "2025-06-01", symbols_client=None) ->
     active_symbols = len(active_ids)
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            # Build trading calendar: dates where >=5 symbols have bars
-            trading_days_rows = conn.execute(
-                text("""
-                    SELECT bar_date
-                    FROM daily_bars.daily_bars
-                    WHERE bar_date >= :start AND bar_date <= :end
-                      AND adjustment_type = 'unadjusted'
-                    GROUP BY bar_date
-                    HAVING COUNT(DISTINCT symbol_id) >= 5
-                    ORDER BY bar_date
-                """),
-                {"start": start, "end": yesterday},
-            ).scalars().all()
-            trading_day_count = len(trading_days_rows)
+    with engine.connect() as conn:
+        # Build trading calendar: dates where >=5 symbols have bars
+        trading_days_rows = conn.execute(
+            text("""
+                SELECT bar_date
+                FROM daily_bars.daily_bars
+                WHERE bar_date >= :start AND bar_date <= :end
+                  AND adjustment_type = 'unadjusted'
+                GROUP BY bar_date
+                HAVING COUNT(DISTINCT symbol_id) >= 5
+                ORDER BY bar_date
+            """),
+            {"start": start, "end": yesterday},
+        ).scalars().all()
+        trading_day_count = len(trading_days_rows)
 
-            # Aggregate backfill stats over the active symbol universe.
-            if active_ids:
-                backfill_stmt = text("""
-                    SELECT
-                        COUNT(*) FILTER (WHERE b.last_queried_at IS NOT NULL) AS symbols_queried,
-                        COUNT(*) FILTER (WHERE b.last_queried_at IS NULL) AS symbols_not_queried,
-                        COUNT(*) FILTER (WHERE bar_counts.bars_have > 0) AS symbols_with_bars,
-                        COUNT(*) FILTER (WHERE bar_counts.bars_have = 0 OR bar_counts.bars_have IS NULL) AS symbols_no_bars,
-                        COALESCE(SUM(bar_counts.bars_have), 0) AS total_bars_have
-                    FROM unnest(:active_ids) AS s(id)
-                    LEFT JOIN daily_bars.symbol_backfill_status b
-                        ON b.symbol_id = s.id
-                    LEFT JOIN LATERAL (
-                        SELECT COUNT(d.bar_date) AS bars_have
-                        FROM daily_bars.daily_bars d
-                        WHERE d.symbol_id = s.id
-                          AND d.bar_date >= :start
-                          AND d.bar_date <= :end
-                          AND d.adjustment_type = 'unadjusted'
-                    ) bar_counts ON true
-                """).bindparams(bindparam("active_ids", type_=ARRAY(Integer)))
-                backfill_stats = conn.execute(
-                    backfill_stmt,
-                    {"active_ids": active_ids, "start": start, "end": yesterday},
-                ).mappings().one()
-                symbols_queried = int(backfill_stats["symbols_queried"])
-                symbols_not_queried = int(backfill_stats["symbols_not_queried"])
-                symbols_with_bars = int(backfill_stats["symbols_with_bars"])
-                symbols_no_bars = int(backfill_stats["symbols_no_bars"])
-                total_bars_have = int(backfill_stats["total_bars_have"])
-            else:
-                symbols_queried = symbols_not_queried = 0
-                symbols_with_bars = symbols_no_bars = 0
-                total_bars_have = 0
-    finally:
-        engine.dispose()
+        # Aggregate backfill stats over the active symbol universe.
+        if active_ids:
+            backfill_stmt = text("""
+                SELECT
+                    COUNT(*) FILTER (WHERE b.last_queried_at IS NOT NULL) AS symbols_queried,
+                    COUNT(*) FILTER (WHERE b.last_queried_at IS NULL) AS symbols_not_queried,
+                    COUNT(*) FILTER (WHERE bar_counts.bars_have > 0) AS symbols_with_bars,
+                    COUNT(*) FILTER (WHERE bar_counts.bars_have = 0 OR bar_counts.bars_have IS NULL) AS symbols_no_bars,
+                    COALESCE(SUM(bar_counts.bars_have), 0) AS total_bars_have
+                FROM unnest(:active_ids) AS s(id)
+                LEFT JOIN daily_bars.symbol_backfill_status b
+                    ON b.symbol_id = s.id
+                LEFT JOIN LATERAL (
+                    SELECT COUNT(d.bar_date) AS bars_have
+                    FROM daily_bars.daily_bars d
+                    WHERE d.symbol_id = s.id
+                      AND d.bar_date >= :start
+                      AND d.bar_date <= :end
+                      AND d.adjustment_type = 'unadjusted'
+                ) bar_counts ON true
+            """).bindparams(bindparam("active_ids", type_=ARRAY(Integer)))
+            backfill_stats = conn.execute(
+                backfill_stmt,
+                {"active_ids": active_ids, "start": start, "end": yesterday},
+            ).mappings().one()
+            symbols_queried = int(backfill_stats["symbols_queried"])
+            symbols_not_queried = int(backfill_stats["symbols_not_queried"])
+            symbols_with_bars = int(backfill_stats["symbols_with_bars"])
+            symbols_no_bars = int(backfill_stats["symbols_no_bars"])
+            total_bars_have = int(backfill_stats["total_bars_have"])
+        else:
+            symbols_queried = symbols_not_queried = 0
+            symbols_with_bars = symbols_no_bars = 0
+            total_bars_have = 0
 
     pct = (symbols_queried / active_symbols * 100) if active_symbols > 0 else 0.0
 
@@ -437,66 +436,63 @@ def get_coverage_gaps(
     active_ids = [s.symbol_id for s in symbols_client.list_active_symbols()]
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            values: dict[str, Any] = {
-                "reference_ticker": reference_ticker,
-                "adjustment_type": adjustment_type,
-                "active_ids": active_ids,
-                "limit": limit,
-                "offset": offset,
-            }
-            date_filters = []
-            if from_date is not None:
-                date_filters.append("d.bar_date >= :from_date")
-                values["from_date"] = from_date
-            if to_date is not None:
-                date_filters.append("d.bar_date <= :to_date")
-                values["to_date"] = to_date
-            date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
+    with engine.connect() as conn:
+        values: dict[str, Any] = {
+            "reference_ticker": reference_ticker,
+            "adjustment_type": adjustment_type,
+            "active_ids": active_ids,
+            "limit": limit,
+            "offset": offset,
+        }
+        date_filters = []
+        if from_date is not None:
+            date_filters.append("d.bar_date >= :from_date")
+            values["from_date"] = from_date
+        if to_date is not None:
+            date_filters.append("d.bar_date <= :to_date")
+            values["to_date"] = to_date
+        date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
 
-            total_days = conn.execute(
-                text(f"""
-                    SELECT COUNT(DISTINCT d.bar_date)
+        total_days = conn.execute(
+            text(f"""
+                SELECT COUNT(DISTINCT d.bar_date)
+                FROM daily_bars.daily_bars d
+                WHERE d.ticker = :reference_ticker
+                  AND d.adjustment_type = :adjustment_type
+                  {date_clause}
+            """),
+            values,
+        ).scalar_one()
+
+        if total_days == 0:
+            return None
+
+        rows = conn.execute(
+            text(f"""
+                WITH calendar AS (
+                    SELECT DISTINCT d.bar_date
                     FROM daily_bars.daily_bars d
                     WHERE d.ticker = :reference_ticker
                       AND d.adjustment_type = :adjustment_type
                       {date_clause}
-                """),
-                values,
-            ).scalar_one()
-
-            if total_days == 0:
-                return None
-
-            rows = conn.execute(
-                text(f"""
-                    WITH calendar AS (
-                        SELECT DISTINCT d.bar_date
-                        FROM daily_bars.daily_bars d
-                        WHERE d.ticker = :reference_ticker
-                          AND d.adjustment_type = :adjustment_type
-                          {date_clause}
-                    ),
-                    per_day AS (
-                        SELECT d.bar_date, COUNT(DISTINCT d.symbol_id) AS symbols_with_bar
-                        FROM daily_bars.daily_bars d
-                        JOIN calendar c ON c.bar_date = d.bar_date
-                        WHERE d.adjustment_type = :adjustment_type
-                          AND d.symbol_id = ANY(:active_ids)
-                        GROUP BY d.bar_date
-                    )
-                    SELECT c.bar_date,
-                           COALESCE(p.symbols_with_bar, 0) AS symbols_with_bar
-                    FROM calendar c
-                    LEFT JOIN per_day p ON p.bar_date = c.bar_date
-                    ORDER BY c.bar_date ASC
-                    LIMIT :limit OFFSET :offset
-                """).bindparams(bindparam("active_ids", type_=ARRAY(Integer))),
-                values,
-            ).mappings().all()
-    finally:
-        engine.dispose()
+                ),
+                per_day AS (
+                    SELECT d.bar_date, COUNT(DISTINCT d.symbol_id) AS symbols_with_bar
+                    FROM daily_bars.daily_bars d
+                    JOIN calendar c ON c.bar_date = d.bar_date
+                    WHERE d.adjustment_type = :adjustment_type
+                      AND d.symbol_id = ANY(:active_ids)
+                    GROUP BY d.bar_date
+                )
+                SELECT c.bar_date,
+                       COALESCE(p.symbols_with_bar, 0) AS symbols_with_bar
+                FROM calendar c
+                LEFT JOIN per_day p ON p.bar_date = c.bar_date
+                ORDER BY c.bar_date ASC
+                LIMIT :limit OFFSET :offset
+            """).bindparams(bindparam("active_ids", type_=ARRAY(Integer))),
+            values,
+        ).mappings().all()
 
     active_total = len(active_ids)
     items = []
@@ -546,83 +542,80 @@ def get_gap_symbols(
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            values: dict[str, Any] = {
-                "reference_ticker": reference_ticker,
-                "adjustment_type": adjustment_type,
-                "limit": limit,
-                "offset": offset,
-            }
-            date_filters = []
-            if from_date is not None:
-                date_filters.append("d.bar_date >= :from_date")
-                values["from_date"] = from_date
-            if to_date is not None:
-                date_filters.append("d.bar_date <= :to_date")
-                values["to_date"] = to_date
-            date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
+    with engine.connect() as conn:
+        values: dict[str, Any] = {
+            "reference_ticker": reference_ticker,
+            "adjustment_type": adjustment_type,
+            "limit": limit,
+            "offset": offset,
+        }
+        date_filters = []
+        if from_date is not None:
+            date_filters.append("d.bar_date >= :from_date")
+            values["from_date"] = from_date
+        if to_date is not None:
+            date_filters.append("d.bar_date <= :to_date")
+            values["to_date"] = to_date
+        date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
 
-            trading_days = conn.execute(
-                text(f"""
-                    SELECT COUNT(DISTINCT d.bar_date)
+        trading_days = conn.execute(
+            text(f"""
+                SELECT COUNT(DISTINCT d.bar_date)
+                FROM daily_bars.daily_bars d
+                WHERE d.ticker = :reference_ticker
+                  AND d.adjustment_type = :adjustment_type
+                  {date_clause}
+            """),
+            values,
+        ).scalar_one()
+
+        if trading_days == 0:
+            return None
+
+        rows = conn.execute(
+            text(f"""
+                WITH calendar AS (
+                    SELECT DISTINCT d.bar_date
                     FROM daily_bars.daily_bars d
                     WHERE d.ticker = :reference_ticker
                       AND d.adjustment_type = :adjustment_type
                       {date_clause}
-                """),
-                values,
-            ).scalar_one()
-
-            if trading_days == 0:
-                return None
-
-            rows = conn.execute(
-                text(f"""
-                    WITH calendar AS (
-                        SELECT DISTINCT d.bar_date
-                        FROM daily_bars.daily_bars d
-                        WHERE d.ticker = :reference_ticker
-                          AND d.adjustment_type = :adjustment_type
-                          {date_clause}
-                    ),
-                    sym AS (
-                        SELECT d.symbol_id, d.ticker,
-                               MIN(d.bar_date) AS first_date,
-                               MAX(d.bar_date) AS last_date
-                        FROM daily_bars.daily_bars d
-                        WHERE d.adjustment_type = :adjustment_type
-                        GROUP BY d.symbol_id, d.ticker
-                    ),
-                    expected AS (
-                        SELECT s.symbol_id, s.ticker, s.first_date, s.last_date,
-                               COUNT(c.bar_date) AS expected_days
-                        FROM sym s
-                        JOIN calendar c
-                            ON c.bar_date >= s.first_date AND c.bar_date <= s.last_date
-                        GROUP BY s.symbol_id, s.ticker, s.first_date, s.last_date
-                    ),
-                    present AS (
-                        SELECT d.symbol_id, COUNT(DISTINCT d.bar_date) AS present_days
-                        FROM daily_bars.daily_bars d
-                        JOIN calendar c ON c.bar_date = d.bar_date
-                        WHERE d.adjustment_type = :adjustment_type
-                        GROUP BY d.symbol_id
-                    )
-                    SELECT e.symbol_id, e.ticker, e.first_date, e.last_date,
-                           e.expected_days,
-                           COALESCE(p.present_days, 0) AS present_days,
-                           e.expected_days - COALESCE(p.present_days, 0) AS gap_days
-                    FROM expected e
-                    LEFT JOIN present p ON p.symbol_id = e.symbol_id
-                    WHERE e.expected_days - COALESCE(p.present_days, 0) > 0
-                    ORDER BY gap_days DESC, e.ticker ASC
-                    LIMIT :limit OFFSET :offset
-                """),
-                values,
-            ).mappings().all()
-    finally:
-        engine.dispose()
+                ),
+                sym AS (
+                    SELECT d.symbol_id, d.ticker,
+                           MIN(d.bar_date) AS first_date,
+                           MAX(d.bar_date) AS last_date
+                    FROM daily_bars.daily_bars d
+                    WHERE d.adjustment_type = :adjustment_type
+                    GROUP BY d.symbol_id, d.ticker
+                ),
+                expected AS (
+                    SELECT s.symbol_id, s.ticker, s.first_date, s.last_date,
+                           COUNT(c.bar_date) AS expected_days
+                    FROM sym s
+                    JOIN calendar c
+                        ON c.bar_date >= s.first_date AND c.bar_date <= s.last_date
+                    GROUP BY s.symbol_id, s.ticker, s.first_date, s.last_date
+                ),
+                present AS (
+                    SELECT d.symbol_id, COUNT(DISTINCT d.bar_date) AS present_days
+                    FROM daily_bars.daily_bars d
+                    JOIN calendar c ON c.bar_date = d.bar_date
+                    WHERE d.adjustment_type = :adjustment_type
+                    GROUP BY d.symbol_id
+                )
+                SELECT e.symbol_id, e.ticker, e.first_date, e.last_date,
+                       e.expected_days,
+                       COALESCE(p.present_days, 0) AS present_days,
+                       e.expected_days - COALESCE(p.present_days, 0) AS gap_days
+                FROM expected e
+                LEFT JOIN present p ON p.symbol_id = e.symbol_id
+                WHERE e.expected_days - COALESCE(p.present_days, 0) > 0
+                ORDER BY gap_days DESC, e.ticker ASC
+                LIMIT :limit OFFSET :offset
+            """),
+            values,
+        ).mappings().all()
 
     items = []
     for row in rows:
@@ -670,81 +663,78 @@ def get_gap_dates(
     from sqlalchemy import text
 
     engine = _engine()
-    try:
-        with engine.connect() as conn:
-            values: dict[str, Any] = {
-                "reference_ticker": reference_ticker,
-                "adjustment_type": adjustment_type,
-                "limit": limit,
-                "offset": offset,
-            }
-            date_filters = []
-            if from_date is not None:
-                date_filters.append("d.bar_date >= :from_date")
-                values["from_date"] = from_date
-            if to_date is not None:
-                date_filters.append("d.bar_date <= :to_date")
-                values["to_date"] = to_date
-            date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
+    with engine.connect() as conn:
+        values: dict[str, Any] = {
+            "reference_ticker": reference_ticker,
+            "adjustment_type": adjustment_type,
+            "limit": limit,
+            "offset": offset,
+        }
+        date_filters = []
+        if from_date is not None:
+            date_filters.append("d.bar_date >= :from_date")
+            values["from_date"] = from_date
+        if to_date is not None:
+            date_filters.append("d.bar_date <= :to_date")
+            values["to_date"] = to_date
+        date_clause = ("AND " + " AND ".join(date_filters)) if date_filters else ""
 
-            trading_days = conn.execute(
-                text(f"""
-                    SELECT COUNT(DISTINCT d.bar_date)
+        trading_days = conn.execute(
+            text(f"""
+                SELECT COUNT(DISTINCT d.bar_date)
+                FROM daily_bars.daily_bars d
+                WHERE d.ticker = :reference_ticker
+                  AND d.adjustment_type = :adjustment_type
+                  {date_clause}
+            """),
+            values,
+        ).scalar_one()
+
+        if trading_days == 0:
+            return None
+
+        rows = conn.execute(
+            text(f"""
+                WITH calendar AS (
+                    SELECT DISTINCT d.bar_date
                     FROM daily_bars.daily_bars d
                     WHERE d.ticker = :reference_ticker
                       AND d.adjustment_type = :adjustment_type
                       {date_clause}
-                """),
-                values,
-            ).scalar_one()
-
-            if trading_days == 0:
-                return None
-
-            rows = conn.execute(
-                text(f"""
-                    WITH calendar AS (
-                        SELECT DISTINCT d.bar_date
-                        FROM daily_bars.daily_bars d
-                        WHERE d.ticker = :reference_ticker
-                          AND d.adjustment_type = :adjustment_type
-                          {date_clause}
-                    ),
-                    sym AS (
-                        SELECT d.symbol_id,
-                               MIN(d.bar_date) AS first_date,
-                               MAX(d.bar_date) AS last_date
-                        FROM daily_bars.daily_bars d
-                        WHERE d.adjustment_type = :adjustment_type
-                        GROUP BY d.symbol_id
-                    ),
-                    expected AS (
-                        SELECT c.bar_date, COUNT(*) AS symbols_expected
-                        FROM calendar c
-                        JOIN sym s
-                            ON c.bar_date >= s.first_date AND c.bar_date <= s.last_date
-                        GROUP BY c.bar_date
-                    ),
-                    present AS (
-                        SELECT d.bar_date, COUNT(DISTINCT d.symbol_id) AS symbols_present
-                        FROM daily_bars.daily_bars d
-                        JOIN calendar c ON c.bar_date = d.bar_date
-                        WHERE d.adjustment_type = :adjustment_type
-                        GROUP BY d.bar_date
-                    )
-                    SELECT e.bar_date, e.symbols_expected,
-                           COALESCE(p.symbols_present, 0) AS symbols_present,
-                           e.symbols_expected - COALESCE(p.symbols_present, 0) AS symbols_missing
-                    FROM expected e
-                    LEFT JOIN present p ON p.bar_date = e.bar_date
-                    WHERE e.symbols_expected - COALESCE(p.symbols_present, 0) > 0
-                    ORDER BY symbols_missing DESC, e.bar_date DESC
-                    LIMIT :limit OFFSET :offset
-                """),
-                values,
-            ).mappings().all()
-    finally:
-        engine.dispose()
+                ),
+                sym AS (
+                    SELECT d.symbol_id,
+                           MIN(d.bar_date) AS first_date,
+                           MAX(d.bar_date) AS last_date
+                    FROM daily_bars.daily_bars d
+                    WHERE d.adjustment_type = :adjustment_type
+                    GROUP BY d.symbol_id
+                ),
+                expected AS (
+                    SELECT c.bar_date, COUNT(*) AS symbols_expected
+                    FROM calendar c
+                    JOIN sym s
+                        ON c.bar_date >= s.first_date AND c.bar_date <= s.last_date
+                    GROUP BY c.bar_date
+                ),
+                present AS (
+                    SELECT d.bar_date, COUNT(DISTINCT d.symbol_id) AS symbols_present
+                    FROM daily_bars.daily_bars d
+                    JOIN calendar c ON c.bar_date = d.bar_date
+                    WHERE d.adjustment_type = :adjustment_type
+                    GROUP BY d.bar_date
+                )
+                SELECT e.bar_date, e.symbols_expected,
+                       COALESCE(p.symbols_present, 0) AS symbols_present,
+                       e.symbols_expected - COALESCE(p.symbols_present, 0) AS symbols_missing
+                FROM expected e
+                LEFT JOIN present p ON p.bar_date = e.bar_date
+                WHERE e.symbols_expected - COALESCE(p.symbols_present, 0) > 0
+                ORDER BY symbols_missing DESC, e.bar_date DESC
+                LIMIT :limit OFFSET :offset
+            """),
+            values,
+        ).mappings().all()
 
     items = []
     for row in rows:
