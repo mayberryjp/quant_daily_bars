@@ -10,6 +10,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from quant_daily_bars.localtime import local_timezone_name
+
 
 EXPECTED_SCHEMA_VERSION = "0004_rename_schema_to_daily_bars"
 EXPECTED_TABLES = (
@@ -154,7 +156,7 @@ def bars_ingest(args: argparse.Namespace) -> None:
 
     interval = getattr(args, "schedule", None)
     run_at = getattr(args, "run_at", None)
-    run_timezone = getattr(args, "timezone", "UTC")
+    run_timezone = getattr(args, "timezone", local_timezone_name())
     run_once = interval is None and run_at is None
 
     if interval is not None and run_at is not None:
@@ -172,17 +174,19 @@ def bars_ingest(args: argparse.Namespace) -> None:
             )
             time.sleep(wait)
 
-            if datetime.now(ZoneInfo(run_timezone)).weekday() >= 5:
+        current_date = datetime.now(ZoneInfo(run_timezone)).date()
+        if run_at:
+            if current_date.weekday() >= 5:
                 logging.getLogger(__name__).info(
                     "skipping ingest: weekend in %s", run_timezone,
                 )
                 continue
 
-        # In scheduled mode, automatically compute yesterday's date each cycle.
+        # Use the schedule's date, not the host's date or yesterday's session.
         if args.from_date is not None:
             from_date = args.from_date
         else:
-            from_date = date.today() - timedelta(days=1)
+            from_date = current_date
         to_date = args.to_date or from_date
         tickers = [t.strip() for t in args.tickers.split(",")] if args.tickers else None
 
@@ -624,7 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
     bars_subparsers = bars_parser.add_subparsers(dest="bars_command", required=True)
 
     ingest_parser = bars_subparsers.add_parser("ingest")
-    ingest_parser.add_argument("--from-date", type=_parse_date, default=None, help="Start date (YYYY-MM-DD). Required for one-shot; defaults to yesterday in scheduled mode.")
+    ingest_parser.add_argument("--from-date", type=_parse_date, default=None, help="Start date (YYYY-MM-DD). Required for one-shot; defaults to today in the configured timezone in scheduled mode.")
     ingest_parser.add_argument("--to-date", type=_parse_date, default=None, help="End date (YYYY-MM-DD, default: same as from-date)")
     ingest_parser.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: all active)")
     ingest_parser.add_argument("--adjustment-type", choices=("unadjusted", "split_adjusted"), default="unadjusted")
@@ -633,15 +637,15 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_parser.add_argument("--dry-run", action="store_true", help="Parse bars without database writes")
     ingest_parser.add_argument(
         "--schedule", type=int, metavar="SECONDS",
-        help="Run continuously, sleeping SECONDS between ingests. Automatically ingests previous day's bars each cycle.",
+        help="Run continuously, sleeping SECONDS between ingests. Automatically ingests today's bars in the configured timezone each cycle.",
     )
     ingest_parser.add_argument(
         "--run-at", metavar="HH:MM",
         help="Run once daily at HH:MM in the configured timezone. Does not run at startup.",
     )
     ingest_parser.add_argument(
-        "--timezone", default="UTC", metavar="ZONE",
-        help="IANA timezone for --run-at (default: UTC).",
+        "--timezone", default=local_timezone_name(), metavar="ZONE",
+        help="IANA timezone for scheduling and automatic ingest dates (default: container local timezone, or America/New_York).",
     )
     ingest_parser.set_defaults(func=bars_ingest)
 

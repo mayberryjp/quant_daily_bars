@@ -1,11 +1,20 @@
 """Tests for CLI parser construction."""
 
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
 
 from quant_daily_bars._cli_impl import build_parser, _contiguous_ranges, _seconds_until_next_jst_1930
+from quant_daily_bars import _cli_impl as cli
 
 
 class TestCLIParser:
+    def test_ingest_timezone_defaults_to_container_timezone(self, monkeypatch):
+        monkeypatch.setenv("TZ", "America/New_York")
+        args = build_parser().parse_args(["bars", "ingest", "--run-at", "19:00"])
+        assert args.timezone == "America/New_York"
+
     def test_db_upgrade_parses(self):
         parser = build_parser()
         args = parser.parse_args(["db", "upgrade"])
@@ -127,6 +136,78 @@ class TestSecondsUntilJST1930:
     def test_result_is_positive(self):
         result = _seconds_until_next_jst_1930()
         assert 0 < result <= 86400
+
+
+@pytest.mark.parametrize("schedule", [["--run-at", "19:00"], ["--schedule", "86400"]])
+@pytest.mark.parametrize(
+    "instant, expected_date",
+    [
+        (datetime(2026, 10, 10, 1, tzinfo=timezone.utc), date(2026, 10, 9)),
+        (datetime(2026, 11, 7, 1, tzinfo=timezone.utc), date(2026, 11, 6)),
+    ],
+)
+def test_scheduled_ingest_uses_same_day_in_schedule_timezone(
+    monkeypatch, schedule, instant, expected_date
+):
+    options = _run_ingest_cycle(monkeypatch, schedule, instant)
+    assert len(options) == 1
+    assert options[0].from_date == expected_date
+    assert options[0].to_date == expected_date
+
+
+def test_daily_ingest_skips_local_weekend(monkeypatch):
+    options = _run_ingest_cycle(
+        monkeypatch, ["--run-at", "19:00"],
+        datetime(2026, 10, 11, 1, tzinfo=timezone.utc),
+    )
+    assert options == []
+
+
+def test_scheduled_ingest_preserves_explicit_dates(monkeypatch):
+    options = _run_ingest_cycle(
+        monkeypatch,
+        ["--schedule", "86400", "--from-date", "2026-09-04", "--to-date", "2026-09-11"],
+        datetime(2026, 10, 10, 1, tzinfo=timezone.utc),
+    )
+    assert options[0].from_date == date(2026, 9, 4)
+    assert options[0].to_date == date(2026, 9, 11)
+
+
+def _run_ingest_cycle(monkeypatch, schedule, instant):
+    from quant_daily_bars.ingest import job
+    from quant_daily_bars.vendors.polygon.client import PolygonBarsClient
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz)
+
+    captured = []
+    sleeps = 0
+
+    def sleep(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if "--run-at" not in schedule or sleeps > 1:
+            raise KeyboardInterrupt
+
+    def run(options):
+        captured.append(options)
+        return SimpleNamespace(
+            format_line=lambda: "completed", warnings=[], failures=[], status="completed"
+        )
+
+    monkeypatch.setattr(cli, "datetime", FixedDatetime)
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+    monkeypatch.setattr(cli, "_seconds_until_next_run_at", lambda *_: 0)
+    monkeypatch.setattr(PolygonBarsClient, "from_env", lambda: object())
+    monkeypatch.setattr(job, "DailyBarIngestJob", lambda **_: SimpleNamespace(run=run))
+    args = build_parser().parse_args(
+        ["bars", "ingest", "--dry-run", "--timezone", "America/New_York", *schedule]
+    )
+    with pytest.raises(KeyboardInterrupt):
+        cli.bars_ingest(args)
+    return captured
 
 
 class TestContiguousRanges:

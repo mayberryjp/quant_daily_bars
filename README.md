@@ -106,8 +106,18 @@ MASSIVE_API_KEY=... python3 -m quant_daily_bars.cli bars ingest \
 
 ```bash
 MASSIVE_API_KEY=... python3 -m quant_daily_bars.cli bars ingest \
-    --from-date 2024-06-08 --mode incremental --schedule 86400
+    --run-at 19:00 --timezone America/New_York --mode incremental
 ```
+
+Scheduled ingestion without `--from-date` requests the current date in the
+configured timezone, including Friday's bars on Friday. The daily `--run-at`
+worker skips weekends; `--schedule SECONDS` uses the same current-date default
+but sleeps between runs. Explicit date ranges remain unchanged.
+
+Schedule ingestion after the regular market close and run downstream momentum
+later, using the same timezone in the actual deployment configuration.
+After deploying this fix, backfill previously missed trading sessions before
+recomputing historical momentum; changing the schedule does not repair old gaps.
 
 ### Run summary
 
